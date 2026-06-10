@@ -1,0 +1,18 @@
+# Build output
+/torchio
+/dist/
+*.test
+*.out
+
+# Local state and spool (P3: stato fuori dal repo)
+/var/
+*.db
+*.db-wal
+*.db-shm
+
+# Editor
+.idea/
+.vscode/
+
+# Built test WASM modules (compiled on demand from testdata/*/main.go)
+*.wasm

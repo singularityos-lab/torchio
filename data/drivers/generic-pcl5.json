@@ -1,0 +1,13 @@
+{
+  "name": "generic-pcl5",
+  "version": "1.0.0",
+  "accepts": ["image/pwg-raster"],
+  "produces": "vendor/pcl5",
+  "capabilities": {
+    "media": ["iso_a4_210x297mm", "na_letter_8.5x11in"],
+    "resolutions": ["300dpi", "600dpi"],
+    "duplex": ["none"],
+    "color": ["monochrome"]
+  },
+  "quirks": ["needs-trailing-formfeed"]
+}

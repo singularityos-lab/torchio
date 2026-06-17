@@ -76,16 +76,18 @@ func (s *Service) AddDiscovered(args AddDiscoveredArgs, reply *PrinterReply) err
 	if err != nil {
 		return fmt.Errorf("probe %s: %w", dev.uri, err)
 	}
+	raw, _ := msg.EncodeBytes()
 	now := time.Now()
 	p := &model.Printer{
-		ID:      model.NewID(),
-		Name:    name,
-		URI:     dev.uri,
-		Origin:  model.OriginDiscoveredConfirmed,
-		Default: args.MakeDefault,
-		Caps:    ipp.ParseCapabilities(msg),
-		Created: now,
-		Updated: now,
+		ID:       model.NewID(),
+		Name:     name,
+		URI:      dev.uri,
+		Origin:   model.OriginDiscoveredConfirmed,
+		Default:  args.MakeDefault,
+		Caps:     ipp.ParseCapabilities(msg),
+		RawAttrs: raw,
+		Created:  now,
+		Updated:  now,
 	}
 	if err := s.store.SavePrinter(p); err != nil {
 		return err

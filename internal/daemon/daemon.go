@@ -157,7 +157,10 @@ func (d *Daemon) startCupsCompat(ctx context.Context) {
 	}
 	_ = os.Chmod(sock, 0o666) // apps run as the user; the socket dir gates access
 
-	srv := &http.Server{Handler: cupscompat.New(cupsBackend{store: d.store, engine: d.engine})}
+	compat := cupscompat.New(cupsBackend{store: d.store, engine: d.engine})
+	// Per-operation tracing, quiet by default (raise the log level to see it).
+	compat.Logf = func(f string, a ...any) { d.log.Debug("cupscompat " + fmt.Sprintf(f, a...)) }
+	srv := &http.Server{Handler: compat}
 	d.cupsSrv = srv
 	d.cupsLn = ln
 	go func() {

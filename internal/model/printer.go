@@ -29,6 +29,12 @@ type Printer struct {
 	// printer's IPP attributes.
 	Caps Capabilities
 
+	// RawAttrs is the encoded Get-Printer-Attributes response captured when the
+	// printer was added: the printer's full IPP attribute set. The CUPS-compat
+	// front end replays it (with the queue-specific attributes overridden) so
+	// libcups clients see exactly what the real printer advertises.
+	RawAttrs []byte
+
 	Created time.Time
 	Updated time.Time
 }

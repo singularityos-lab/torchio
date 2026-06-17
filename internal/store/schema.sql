@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS printers (
     origin     TEXT    NOT NULL,
     is_default INTEGER NOT NULL DEFAULT 0,
     caps_json  TEXT    NOT NULL DEFAULT '{}',
+    attrs_raw  BLOB    NOT NULL DEFAULT x'',
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
 );

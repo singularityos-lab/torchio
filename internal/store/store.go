@@ -45,6 +45,14 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
+	// Lightweight migrations for databases created by an earlier version. These
+	// are best-effort: a "duplicate column" error just means the migration
+	// already ran (or the fresh schema already has the column).
+	for _, mig := range []string{
+		`ALTER TABLE printers ADD COLUMN attrs_raw BLOB NOT NULL DEFAULT x''`,
+	} {
+		_, _ = db.Exec(mig)
+	}
 	return &Store{db: db}, nil
 }
 

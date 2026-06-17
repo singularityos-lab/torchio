@@ -38,6 +38,10 @@ type Backend interface {
 type Server struct {
 	backend Backend
 
+	// Logf, if set, receives one line per request (the operation and outcome).
+	// The daemon wires it to its logger; it defaults to a no-op.
+	Logf func(format string, args ...any)
+
 	mu      sync.Mutex
 	counter int
 	jobs    map[int]*compatJob // CUPS integer job-id -> job
@@ -56,14 +60,28 @@ type compatJob struct {
 
 // New builds a compat server over the backend.
 func New(b Backend) *Server {
-	return &Server{backend: b, jobs: map[int]*compatJob{}}
+	return &Server{backend: b, jobs: map[int]*compatJob{}, Logf: func(string, ...any) {}}
 }
 
 // ServeHTTP implements the CUPS IPP endpoint. It dispatches on the IPP
 // operation code, not the URL path, so it works for any path libcups posts to.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		// libcups also does GETs for the web UI; we only serve IPP.
+		// A GET for /printers/NAME.ppd is a client (Chromium) asking for the
+		// queue's driver file. Our queues are driverless, so we synthesize a PPD
+		// from the printer's IPP capabilities, like CUPS does for its temporary
+		// queues. Without this the printer is dropped from the print dialog.
+		if name, ok := ppdQueueName(r.URL.Path); ok {
+			p, found := s.backend.PrinterByName(name)
+			if !found {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "application/vnd.cups-ppd")
+			_, _ = io.WriteString(w, generatePPD(p))
+			s.Logf("served PPD for %s", name)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -77,7 +95,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := goipp.NewResponse(goipp.DefaultVersion, goipp.StatusOk, req.RequestID)
 	opAttrs(resp)
 
-	switch goipp.Op(req.Code) {
+	op := goipp.Op(req.Code)
+	switch op {
 	case goipp.OpCupsGetDefault:
 		s.cupsGetDefault(resp)
 	case goipp.OpCupsGetPrinters:
@@ -101,6 +120,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		resp.Code = goipp.Code(goipp.StatusErrorOperationNotSupported)
 	}
+	s.Logf("op=%s status=%s", op, goipp.Status(resp.Code))
 
 	payload, err := resp.EncodeBytes()
 	if err != nil {

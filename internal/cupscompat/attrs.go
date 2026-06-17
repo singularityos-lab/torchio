@@ -35,6 +35,18 @@ func opAttrs(m *goipp.Message) {
 // (cupsGetDests) and the GTK/Qt print dialogs expect. The queue URI uses the
 // CUPS local form ipp://localhost/printers/NAME.
 func printerAttrs(p model.Printer) goipp.Attributes {
+	// Preferred path: replay the real printer's full IPP attribute set, with the
+	// queue-specific attributes overridden. This is what makes libcups clients
+	// (Chromium's CUPS-IPP backend, Qt) accept the printer: they see the exact
+	// rich attribute set the backend printer advertises (media-col-database,
+	// ipp-features-supported, resolutions, ...), not a thin synthesized subset.
+	if len(p.RawAttrs) > 0 {
+		var msg goipp.Message
+		if err := msg.DecodeBytes(p.RawAttrs); err == nil && len(msg.Printer) > 0 {
+			return overrideQueueAttrs(msg.Printer, p)
+		}
+	}
+
 	var a goipp.Attributes
 	queueURI := "ipp://localhost/printers/" + p.Name
 
@@ -79,6 +91,55 @@ func printerAttrs(p model.Printer) goipp.Attributes {
 	addKeywords(&a, "sides-default", firstOf(p.Caps.Sides))
 	addKeywords(&a, "print-color-mode-supported", p.Caps.ColorModes)
 	return a
+}
+
+// overrideQueueAttrs takes the backend printer's real attributes and replaces
+// the few that must describe the CUPS queue instead of the backend device, so
+// clients submit jobs to Torchio (the queue), not directly to the printer.
+func overrideQueueAttrs(real goipp.Attributes, p model.Printer) goipp.Attributes {
+	override := map[string]bool{
+		"printer-name":                 true,
+		"printer-uri-supported":        true,
+		"uri-authentication-supported": true,
+		"uri-security-supported":       true,
+		"printer-info":                 true,
+		"printer-more-info":            true,
+		"printer-dns-sd-name":          true,
+		"device-uri":                   true,
+		"printer-type":                 true,
+	}
+	var out goipp.Attributes
+	for _, attr := range real {
+		if !override[attr.Name] {
+			out.Add(attr)
+		}
+	}
+	queueURI := "ipp://localhost/printers/" + p.Name
+	out.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(p.Name)))
+	out.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(queueURI)))
+	out.Add(goipp.MakeAttribute("uri-authentication-supported", goipp.TagKeyword, goipp.String("none")))
+	out.Add(goipp.MakeAttribute("uri-security-supported", goipp.TagKeyword, goipp.String("none")))
+	out.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(displayName(real, p))))
+	out.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(p.URI)))
+	out.Add(goipp.MakeAttribute("printer-type", goipp.TagEnum, goipp.Integer(printerType(p))))
+	return out
+}
+
+// displayName is the human-facing label for the queue: the printer's real
+// DNS-SD name (what CUPS shows), then its make-and-model, falling back to the
+// queue name. This is why a queue the user called "brother" still appears as
+// "Brother MFC-J5740DW" in the print dialog, matching system CUPS.
+func displayName(real goipp.Attributes, p model.Printer) string {
+	if s, ok := strAttr(real, "printer-dns-sd-name"); ok && s != "" {
+		return s
+	}
+	if s, ok := strAttr(real, "printer-make-and-model"); ok && s != "" {
+		return stripLocaleTag(s)
+	}
+	if p.Caps.MakeAndModel != "" {
+		return stripLocaleTag(p.Caps.MakeAndModel)
+	}
+	return p.Name
 }
 
 // jobAttrs builds the attribute set for one job.

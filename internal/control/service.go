@@ -52,17 +52,19 @@ func (s *Service) AddPrinter(args AddPrinterArgs, reply *PrinterReply) error {
 		return fmt.Errorf("probe %s: %w", args.URI, err)
 	}
 	caps := ipp.ParseCapabilities(msg)
+	raw, _ := msg.EncodeBytes()
 
 	now := time.Now()
 	p := &model.Printer{
-		ID:      model.NewID(),
-		Name:    args.Name,
-		URI:     args.URI,
-		Origin:  model.OriginManual,
-		Default: args.MakeDefault,
-		Caps:    caps,
-		Created: now,
-		Updated: now,
+		ID:       model.NewID(),
+		Name:     args.Name,
+		URI:      args.URI,
+		Origin:   model.OriginManual,
+		Default:  args.MakeDefault,
+		Caps:     caps,
+		RawAttrs: raw,
+		Created:  now,
+		Updated:  now,
 	}
 	if err := s.store.SavePrinter(p); err != nil {
 		return fmt.Errorf("save printer: %w", err)

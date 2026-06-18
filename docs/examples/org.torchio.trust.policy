@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  PolicyKit actions for Torchio's "polkit" trust backend:
+      TORCHIO_TRUST_BACKEND=polkit torchio daemon
+
+  Install on distributions that run polkit (this is NOT used on Singularity,
+  where the ush broker is the only trust backend, principle P4):
+      /usr/share/polkit-1/actions/org.torchio.trust.policy
+
+  Each Torchio permission category maps to one action id below. Tune the
+  <defaults> to your distribution's policy; auth_self_keep prompts the active
+  user for their own password and remembers the decision.
+-->
+<policyconfig>
+  <vendor>Torchio</vendor>
+  <vendor_url>https://github.com/singularityos-lab/torchio</vendor_url>
+
+  <action id="org.torchio.trust.network">
+    <description>Add or use a network printer</description>
+    <message>Authentication is required to let Torchio use a network printer</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.torchio.trust.device">
+    <description>Use a USB printer or device</description>
+    <message>Authentication is required to let Torchio use a connected device</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.torchio.trust.filesystem">
+    <description>Access a file on behalf of a print job</description>
+    <message>Authentication is required to let Torchio access a file</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+
+  <action id="org.torchio.trust.dbus.sensitive">
+    <description>Perform a sensitive inter-process action</description>
+    <message>Authentication is required for a sensitive Torchio action</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

@@ -49,6 +49,31 @@ func SpoolDir() (string, error) {
 	return filepath.Join(dir, "spool"), nil
 }
 
+// ConfigDir returns the per-user configuration directory (XDG_CONFIG_HOME). It
+// is not created: configuration is read-only intent (principle P3), and its
+// absence is a normal "use defaults" condition, not an error.
+func ConfigDir() (string, error) {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		base = filepath.Join(home, ".config")
+	}
+	return filepath.Join(base, appDir), nil
+}
+
+// TrustPolicyPath returns the default path of the declarative trust policy file,
+// used by the "policy" trust backend when no explicit path is configured.
+func TrustPolicyPath() (string, error) {
+	dir, err := ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "trust.policy"), nil
+}
+
 // SocketPath returns the control Unix-domain-socket path under the runtime dir.
 // It falls back to the state dir when XDG_RUNTIME_DIR is unset (e.g. headless).
 func SocketPath() (string, error) {

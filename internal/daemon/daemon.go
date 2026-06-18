@@ -102,13 +102,29 @@ func Open() (*Daemon, error) {
 	return &Daemon{store: st, spool: sp, engine: eng, server: srv, recorder: rec, pdfium: pdfiumTr, log: log}, nil
 }
 
-// selectPortal chooses the trust backend: the ush D-Bus portal when a session
-// bus is reachable, otherwise deny-by-default.
+// selectPortal chooses the trust backend. The default is the ush broker, the
+// only backend used on Singularity (principle P4); $TORCHIO_TRUST_BACKEND lets
+// other distributions pick polkit, a declarative policy file, or deny-by-default
+// without the core knowing which is in use. Any failure falls back to deny, so
+// a printer is never added, a cert never trusted, without a working backend.
 func selectPortal(log logger.Logger) portal.Portal {
-	p, err := portal.NewDBus("")
+	backend := os.Getenv("TORCHIO_TRUST_BACKEND")
+	if backend == "" {
+		backend = portal.BackendUSH
+	}
+	policyFile := os.Getenv("TORCHIO_TRUST_POLICY")
+	if policyFile == "" {
+		if p, err := paths.TrustPolicyPath(); err == nil {
+			policyFile = p
+		}
+	}
+	p, err := portal.Select(backend, "", policyFile)
 	if err != nil {
-		log.Warn("no session bus for the ush portal; trust decisions will be denied: " + err.Error())
+		log.Warn("trust backend " + backend + " unavailable; denying by default: " + err.Error())
 		return portal.AlwaysDeny{}
+	}
+	if backend == portal.BackendAllow {
+		log.Warn("trust backend is 'allow': every permission is auto-granted (development only)")
 	}
 	return p
 }

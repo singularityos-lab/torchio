@@ -1,0 +1,28 @@
+# Torchio declarative trust policy.
+#
+# Used by the "policy" trust backend:
+#   TORCHIO_TRUST_BACKEND=policy torchio daemon
+# Default location: $XDG_CONFIG_HOME/torchio/trust.policy
+# Override with:    TORCHIO_TRUST_POLICY=/path/to/trust.policy
+#
+# The first matching rule wins; the default applies when none match. A missing
+# file means deny-by-default, so a printer is never added without a rule.
+#
+# Format:
+#   default <allow|deny>
+#   <category|*>  <resource-glob>  <allow|deny>
+#
+#   category      one of: network | device | filesystem | dbus.sensitive | *
+#   resource-glob '*' matches any run of characters (URIs are matched verbatim,
+#                 '/' is NOT special)
+#
+# This sample auto-approves IPP/IPPS printers on the local 192.168.1.0/24 and
+# denies everything else.
+
+default deny
+
+network  ipp://192.168.1.*    allow
+network  ipps://192.168.1.*   allow
+
+# Devices and all other categories stay denied unless added explicitly:
+device   *                    deny

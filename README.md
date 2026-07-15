@@ -1,6 +1,6 @@
 # torchio
 
-An IPP-only print system for Singularity OS that replaces CUPS. It answers the libcups IPP
+An IPP-only print system for Sinty OS that replaces CUPS. It answers the libcups IPP
 dialect on the CUPS socket, so print dialogs, `lp`/`lpstat` and browsers keep working
 against it unchanged. The spooler runs per user, format conversions (pdfium included)
 run as WebAssembly modules, and printers found on the network are added only after the

@@ -378,7 +378,7 @@ con gli attributi che libcups si aspetta (printer-uri-supported in forma
 
 Il daemon lo espone sul socket CUPS (`$TORCHIO_CUPS_SOCKET` o
 `/run/cups/cups.sock`), non-fatale se non riesce a bindare. Deployment: cupsd
-non deve possedere il socket (su Singularity OS non si spedisce cupsd; altrove
+non deve possedere il socket (su Sinty OS non si spedisce cupsd; altrove
 `systemctl mask cups.socket cups.service`).
 
 Validato: test unit con richieste IPP-CUPS reali, e **smoke sul socket Unix

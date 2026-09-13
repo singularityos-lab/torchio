@@ -1,3 +1,5 @@
+@AGENTS.md
+
 # CLAUDE.md, Torchio
 
 Orientamento per le sessioni di lavoro su Torchio. Leggere prima di toccare il

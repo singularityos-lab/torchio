@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/singularityos-lab/torchio/internal/ipp"
 	"github.com/singularityos-lab/torchio/internal/model"
 	"github.com/singularityos-lab/torchio/internal/portal"
 )
@@ -71,33 +70,10 @@ func (s *Service) AddDiscovered(args AddDiscoveredArgs, reply *PrinterReply) err
 		return fmt.Errorf("adding %q was not approved", dev.name)
 	}
 
-	// Approved: probe and create the printer, tagged as discovered+confirmed.
-	msg, err := s.prober.GetPrinterAttributes(ctx, dev.uri)
+	p, err := s.admin.Add(ctx, name, dev.uri, model.OriginDiscoveredConfirmed, args.MakeDefault)
 	if err != nil {
-		return fmt.Errorf("probe %s: %w", dev.uri, err)
-	}
-	raw, _ := msg.EncodeBytes()
-	now := time.Now()
-	p := &model.Printer{
-		ID:       model.NewID(),
-		Name:     name,
-		URI:      dev.uri,
-		Origin:   model.OriginDiscoveredConfirmed,
-		Default:  args.MakeDefault,
-		Caps:     ipp.ParseCapabilities(msg),
-		RawAttrs: raw,
-		Created:  now,
-		Updated:  now,
-	}
-	if err := s.store.SavePrinter(p); err != nil {
 		return err
 	}
-	if args.MakeDefault {
-		if err := s.store.SetDefaultPrinter(p.ID); err != nil {
-			return err
-		}
-	}
-	s.engine.AddPrinter(p)
 	reply.Printer = toPrinterDTO(p)
 	return nil
 }

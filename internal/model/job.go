@@ -2,9 +2,8 @@ package model
 
 import "time"
 
-// JobState is the lifecycle state of a job. The values are chosen to map 1:1
-// onto IPP "job-state" so that sharing a queue is a projection, not a
-// translation. The string values double as the FSM tag tokens on Job.State.
+// JobState is the lifecycle state of a job. The values map 1:1 onto IPP
+// "job-state" so that sharing a queue is a projection, not a translation.
 type JobState string
 
 const (
@@ -30,24 +29,37 @@ const (
 	JobHeld JobState = "held"
 )
 
-// JobFSMTag is the go-foundation FSM definition for a job. The queue actor
-// drives transitions; the machine enforces that only legal moves happen and
-// records the history. sending->pending exists for restart recovery (an
-// in-flight send is requeued and reconciled). *->canceled lets a user cancel
-// from any non-terminal state.
-// pending->spooled is the fast path: when the printer accepts the document
-// format directly the transform plan is empty, so the job skips the
-// transforming state entirely (the doc passes verbatim). pending->transforming
-// is the path taken when a plan exists.
-const JobFSMTag = "initial:created; " +
-	"created->validating; " +
-	"validating->pending; validating->aborted; " +
-	"pending->transforming; pending->spooled; pending->held; pending->aborted; " +
-	"held->pending; " +
-	"transforming->spooled; transforming->aborted; " +
-	"spooled->sending; " +
-	"sending->completed; sending->pending; sending->aborted; " +
-	"*->canceled"
+// transitions lists the legal moves of the job FSM. sending->pending exists
+// for restart recovery: an in-flight send is requeued and reconciled with
+// Get-Job-Attributes. pending->spooled is the passthrough case, where the
+// printer accepts the format and there is nothing to transform. Cancellation
+// is allowed from every non-terminal state and is handled in CanTransition.
+var transitions = map[JobState][]JobState{
+	JobCreated:      {JobValidating},
+	JobValidating:   {JobPending, JobAborted},
+	JobPending:      {JobTransforming, JobSpooled, JobHeld, JobAborted},
+	JobSpooled:      {JobSending, JobHeld},
+	JobHeld:         {JobPending},
+	JobCanceled:     {JobPending},
+	JobAborted:      {JobPending},
+	JobTransforming: {JobSpooled, JobAborted},
+	JobSending:      {JobCompleted, JobPending, JobAborted},
+}
+
+// CanTransition reports whether a job may move from one state to another.
+//
+// Restarting a canceled or aborted job moves it back to pending.
+func CanTransition(from, to JobState) bool {
+	if to == JobCanceled {
+		return !from.IsTerminal()
+	}
+	for _, s := range transitions[from] {
+		if s == to {
+			return true
+		}
+	}
+	return false
+}
 
 // IsTerminal reports whether no further transitions are expected.
 func (s JobState) IsTerminal() bool {
@@ -67,6 +79,10 @@ type JobTicket struct {
 	Media  string // e.g. iso_a4_210x297mm
 	Pages  string // page range, e.g. "1-4,7"
 	Color  string // print-color-mode: monochrome, color, auto
+	// Quality is the IPP print-quality enum: 3 draft, 4 normal, 5 high.
+	Quality int
+	// Hold keeps the job from printing until it is released.
+	Hold bool
 }
 
 // DocRef points at a content-addressed blob in the spool.
@@ -77,13 +93,15 @@ type DocRef struct {
 }
 
 // Job is a unit of work: an FSM plus references to its documents and a ticket.
-// The State field is mutated by the go-foundation FSM (via reflection), so it
-// carries the FSM tag and must stay a plain string.
+// State only changes through CanTransition-checked moves in the queue engine.
 type Job struct {
-	ID        ID
+	ID ID
+	// Number is the small integer job-id shown to CUPS clients, assigned by
+	// the store on first save.
+	Number    int
 	PrinterID ID
 	Name      string
-	State     string `fsm:"initial:created; created->validating; validating->pending; validating->aborted; pending->transforming; pending->spooled; pending->held; pending->aborted; held->pending; transforming->spooled; transforming->aborted; spooled->sending; sending->completed; sending->pending; sending->aborted; *->canceled"`
+	State     string
 
 	Ticket   JobTicket
 	Document DocRef

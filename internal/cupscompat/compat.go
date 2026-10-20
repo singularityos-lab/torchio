@@ -1,76 +1,128 @@
 // Package cupscompat makes Torchio a drop-in for CUPS: it answers the IPP
-// dialect that libcups speaks (the CUPS-Get-Printers / CUPS-Get-Default
-// extensions plus Create-Job/Send-Document) on the CUPS socket, so existing
-// apps (GTK and Qt print dialogs, lp/lpstat, Chromium, anything using libcups)
-// enumerate and print to Torchio's queues without knowing anything changed.
-// The printers it advertises are Torchio's; the jobs it accepts go to the
-// spooler. cupsd must not be running (Torchio owns its socket).
+// dialect libcups speaks on the CUPS socket, including the CUPS extensions for
+// listing, adding and managing queues, so GTK and Qt print dialogs, lp/lpstat,
+// Chromium and printer settings panels work against Torchio's queues. cupsd
+// must not own the socket.
 package cupscompat
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/OpenPrinting/goipp"
 
 	"github.com/singularityos-lab/torchio/internal/model"
 )
 
-// Backend is the slice of Torchio the compat server needs: the configured
-// printers and a way to submit/track jobs. The daemon implements it over the
-// store and queue engine; tests use a fake.
+// Job is a spooler job as CUPS clients see it.
+type Job struct {
+	Number  int
+	Printer string
+	Name    string
+	State   model.JobState
+	Reason  string
+	Size    int64
+	Created time.Time
+	Updated time.Time
+}
+
+// Device is a printer the client may add, as reported by CUPS-Get-Devices.
+type Device struct {
+	URI       string
+	Info      string
+	MakeModel string
+	Location  string
+	Class     string
+}
+
+// PrinterChange is a CUPS-Add-Modify-Printer request. Nil fields are left
+// unchanged.
+type PrinterChange struct {
+	URI       *string
+	Info      *string
+	Location  *string
+	Shared    *bool
+	Accepting *bool
+	Paused    *bool
+	// Message is shown while the queue is paused.
+	Message  *string
+	Defaults model.JobTicket
+}
+
+// Job actions accepted by Backend.JobAction.
+const (
+	ActionCancel  = "cancel"
+	ActionHold    = "hold"
+	ActionRelease = "release"
+	ActionRestart = "restart"
+)
+
+// Which-jobs filters accepted by Backend.Jobs.
+const (
+	WhichActive   = "not-completed"
+	WhichFinished = "completed"
+	WhichAll      = "all"
+)
+
+// ErrNotFound tells the server to answer client-error-not-found.
+var ErrNotFound = errors.New("cupscompat: not found")
+
+// ErrNotPossible tells the server to answer client-error-not-possible.
+var ErrNotPossible = errors.New("cupscompat: not possible")
+
+// Backend is the slice of Torchio the compat server needs. The daemon
+// implements it over the store, the queue engine and the trust backend.
 type Backend interface {
 	ListPrinters() []model.Printer
 	DefaultPrinter() (model.Printer, bool)
 	PrinterByName(name string) (model.Printer, bool)
-	Submit(ctx context.Context, printerName, jobName string, ticket model.JobTicket, doc io.Reader) (spoolerID string, err error)
-	JobState(spoolerID string) (model.JobState, bool)
-	Cancel(ctx context.Context, spoolerID string) error
+	Submit(ctx context.Context, printer, jobName string, ticket model.JobTicket, doc io.Reader) (Job, error)
+	// Create records a job whose document arrives later through Attach.
+	Create(ctx context.Context, printer, jobName string, ticket model.JobTicket) (Job, error)
+	Attach(ctx context.Context, number int, doc io.Reader) (Job, error)
+	Job(number int) (Job, bool)
+	// Jobs lists jobs of one printer, or of every printer when printer is "".
+	Jobs(printer, which string) []Job
+	JobAction(ctx context.Context, number int, action string) error
+	// AddOrModifyPrinter creates the queue when it does not exist.
+	AddOrModifyPrinter(ctx context.Context, name string, c PrinterChange) error
+	DeletePrinter(name string) error
+	SetDefault(name string) error
+	Devices(ctx context.Context) []Device
 }
 
 // Server is the CUPS-compatible IPP front end.
 type Server struct {
 	backend Backend
 
-	// Logf, if set, receives one line per request (the operation and outcome).
-	// The daemon wires it to its logger; it defaults to a no-op.
+	// Logf, if set, receives one line per request.
 	Logf func(format string, args ...any)
 
-	mu      sync.Mutex
-	counter int
-	jobs    map[int]*compatJob // CUPS integer job-id -> job
-}
-
-// compatJob bridges a CUPS integer job-id to a Torchio spooler job. For the
-// Create-Job/Send-Document flow the document is accumulated until the last one.
-type compatJob struct {
-	id        int
-	printer   string
-	name      string
-	ticket    model.JobTicket
-	buf       bytes.Buffer
-	spoolerID string
+	mu sync.Mutex
+	// incoming collects the documents of a Create-Job job until the last one.
+	incoming map[int]*bytes.Buffer
 }
 
 // New builds a compat server over the backend.
 func New(b Backend) *Server {
-	return &Server{backend: b, jobs: map[int]*compatJob{}, Logf: func(string, ...any) {}}
+	return &Server{backend: b, incoming: map[int]*bytes.Buffer{}, Logf: func(string, ...any) {}}
 }
 
 // ServeHTTP implements the CUPS IPP endpoint. It dispatches on the IPP
 // operation code, not the URL path, so it works for any path libcups posts to.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		// A GET for /printers/NAME.ppd is a client (Chromium) asking for the
-		// queue's driver file. Our queues are driverless, so we synthesize a PPD
-		// from the printer's IPP capabilities, like CUPS does for its temporary
-		// queues. Without this the printer is dropped from the print dialog.
+		// Chromium fetches /printers/NAME.ppd and drops a queue without one.
+		// Our queues are driverless, so the PPD is generated from the
+		// printer's IPP capabilities, like CUPS does for temporary queues.
 		if name, ok := ppdQueueName(r.URL.Path); ok {
 			p, found := s.backend.PrinterByName(name)
 			if !found {
@@ -95,6 +147,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp := goipp.NewResponse(goipp.DefaultVersion, goipp.StatusOk, req.RequestID)
 	opAttrs(resp)
 
+	ctx := r.Context()
 	op := goipp.Op(req.Code)
 	switch op {
 	case goipp.OpCupsGetDefault:
@@ -104,19 +157,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case goipp.OpGetPrinterAttributes:
 		s.getPrinterAttributes(req, resp)
 	case goipp.OpValidateJob:
-		// accept
+		s.validateJob(req, resp)
 	case goipp.OpPrintJob:
-		s.printJob(r.Context(), req, body, resp)
+		s.printJob(ctx, req, body, resp)
 	case goipp.OpCreateJob:
-		s.createJob(req, resp)
+		s.createJob(ctx, req, resp)
 	case goipp.OpSendDocument:
-		s.sendDocument(r.Context(), req, body, resp)
+		s.sendDocument(ctx, req, body, resp)
 	case goipp.OpGetJobAttributes:
 		s.getJobAttributes(req, resp)
-	case goipp.OpCancelJob:
-		s.cancelJob(r.Context(), req, resp)
 	case goipp.OpGetJobs:
-		s.getJobs(resp)
+		s.getJobs(req, resp)
+	case goipp.OpCancelJob:
+		s.jobAction(ctx, req, resp, ActionCancel)
+	case goipp.OpHoldJob:
+		s.jobAction(ctx, req, resp, ActionHold)
+	case goipp.OpReleaseJob:
+		s.jobAction(ctx, req, resp, ActionRelease)
+	case goipp.OpRestartJob:
+		s.jobAction(ctx, req, resp, ActionRestart)
+	case goipp.OpSetJobAttributes:
+		s.setJobAttributes(ctx, req, resp)
+	case goipp.OpPurgeJobs, goipp.OpCancelJobs, goipp.OpCancelMyJobs:
+		s.cancelAll(ctx, req, resp)
+	case goipp.OpPausePrinter:
+		reason, _ := strAttr(req.Operation, "printer-state-message")
+		s.change(ctx, req, resp, PrinterChange{Paused: ptr(true), Message: &reason})
+	case goipp.OpResumePrinter:
+		s.change(ctx, req, resp, PrinterChange{Paused: ptr(false)})
+	case goipp.OpCupsAcceptJobs:
+		s.change(ctx, req, resp, PrinterChange{Accepting: ptr(true)})
+	case goipp.OpCupsRejectJobs:
+		s.change(ctx, req, resp, PrinterChange{Accepting: ptr(false)})
+	case goipp.OpCupsAddModifyPrinter:
+		s.addModifyPrinter(ctx, req, resp)
+	case goipp.OpCupsDeletePrinter:
+		s.deletePrinter(req, resp)
+	case goipp.OpCupsSetDefault:
+		s.setDefault(req, resp)
+	case goipp.OpCupsGetDevices:
+		s.getDevices(ctx, resp)
+	case goipp.OpCupsGetPpds:
+		s.getPPDs(resp)
+	case goipp.OpCupsGetClasses:
+		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 	default:
 		resp.Code = goipp.Code(goipp.StatusErrorOperationNotSupported)
 	}
@@ -131,24 +215,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(payload)
 }
 
+func ptr[T any](v T) *T { return &v }
+
 func (s *Server) cupsGetDefault(resp *goipp.Message) {
 	p, ok := s.backend.DefaultPrinter()
 	if !ok {
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	resp.Printer = printerAttrs(p)
+	resp.Printer = s.printerAttrs(p)
 }
 
 // cupsGetPrinters returns one printer group per configured printer. libcups
 // (cupsGetDests) parses these into the destinations every app shows.
 func (s *Server) cupsGetPrinters(resp *goipp.Message) {
-	printers := s.backend.ListPrinters()
 	groups := goipp.Groups{{Tag: goipp.TagOperationGroup, Attrs: resp.Operation}}
-	for _, p := range printers {
-		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: printerAttrs(p)})
+	for _, p := range s.backend.ListPrinters() {
+		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: s.printerAttrs(p)})
 	}
-	resp.Groups = groups // overrides the legacy fields when encoding
+	resp.Groups = groups
 }
 
 func (s *Server) getPrinterAttributes(req goipp.Message, resp *goipp.Message) {
@@ -157,7 +242,22 @@ func (s *Server) getPrinterAttributes(req goipp.Message, resp *goipp.Message) {
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	resp.Printer = printerAttrs(p)
+	resp.Printer = s.printerAttrs(p)
+}
+
+func (s *Server) printerAttrs(p model.Printer) goipp.Attributes {
+	return printerAttrs(p, len(s.backend.Jobs(p.Name, WhichActive)))
+}
+
+func (s *Server) validateJob(req goipp.Message, resp *goipp.Message) {
+	p, ok := s.resolvePrinter(req.Operation)
+	if !ok {
+		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
+		return
+	}
+	if p.Queue.Rejecting {
+		resp.Code = goipp.Code(goipp.StatusErrorNotAcceptingJobs)
+	}
 }
 
 func (s *Server) printJob(ctx context.Context, req goipp.Message, doc io.Reader, resp *goipp.Message) {
@@ -166,131 +266,267 @@ func (s *Server) printJob(ctx context.Context, req goipp.Message, doc io.Reader,
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	j := s.newJob(p.Name, ticketFrom(req), jobName(req))
-	data, _ := io.ReadAll(doc)
-	if err := s.submit(ctx, j, bytes.NewReader(data)); err != nil {
+	job, err := s.backend.Submit(ctx, p.Name, jobName(req), ticketFrom(req), doc)
+	if err != nil {
 		s.fail(resp, err)
 		return
 	}
-	s.jobReply(resp, j, model.JobPending)
+	resp.Job = jobAttrs(job)
 }
 
-func (s *Server) createJob(req goipp.Message, resp *goipp.Message) {
+func (s *Server) createJob(ctx context.Context, req goipp.Message, resp *goipp.Message) {
 	p, ok := s.resolvePrinter(req.Operation)
 	if !ok {
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	j := s.newJob(p.Name, ticketFrom(req), jobName(req))
-	s.jobReply(resp, j, model.JobPending)
+	job, err := s.backend.Create(ctx, p.Name, jobName(req), ticketFrom(req))
+	if err != nil {
+		s.fail(resp, err)
+		return
+	}
+	s.mu.Lock()
+	s.incoming[job.Number] = &bytes.Buffer{}
+	s.mu.Unlock()
+	job.Reason = "job-incoming"
+	resp.Job = jobAttrs(job)
 }
 
 func (s *Server) sendDocument(ctx context.Context, req goipp.Message, doc io.Reader, resp *goipp.Message) {
 	id, _ := intAttr(req.Operation, "job-id")
 	s.mu.Lock()
-	j := s.jobs[id]
+	buf := s.incoming[id]
 	s.mu.Unlock()
-	if j == nil {
+	if buf == nil {
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	if _, err := io.Copy(&j.buf, doc); err != nil {
+	if _, err := io.Copy(buf, doc); err != nil {
 		s.fail(resp, err)
 		return
 	}
-	last, _ := boolAttr(req.Operation, "last-document")
-	if last && j.buf.Len() > 0 {
-		if err := s.submit(ctx, j, bytes.NewReader(j.buf.Bytes())); err != nil {
-			s.fail(resp, err)
-			return
+	if last, _ := boolAttr(req.Operation, "last-document"); !last {
+		if job, ok := s.backend.Job(id); ok {
+			job.Reason = "job-incoming"
+			resp.Job = jobAttrs(job)
+		}
+		return
+	}
+	s.mu.Lock()
+	delete(s.incoming, id)
+	s.mu.Unlock()
+	job, err := s.backend.Attach(ctx, id, buf)
+	if err != nil {
+		s.fail(resp, err)
+		return
+	}
+	resp.Job = jobAttrs(job)
+}
+
+// lookup resolves the job a request is about.
+func (s *Server) lookup(op goipp.Attributes) (Job, bool) {
+	id, ok := intAttr(op, "job-id")
+	if !ok {
+		if uri, found := strAttr(op, "job-uri"); found {
+			id = jobNumber(uri)
 		}
 	}
-	s.jobReply(resp, j, model.JobPending)
+	job, found := s.backend.Job(id)
+	if !found {
+		return Job{}, false
+	}
+	s.mu.Lock()
+	_, incoming := s.incoming[id]
+	s.mu.Unlock()
+	if incoming {
+		job.Reason = "job-incoming"
+	}
+	return job, true
 }
 
 func (s *Server) getJobAttributes(req goipp.Message, resp *goipp.Message) {
-	id, _ := intAttr(req.Operation, "job-id")
-	s.mu.Lock()
-	j := s.jobs[id]
-	s.mu.Unlock()
-	if j == nil {
+	job, ok := s.lookup(req.Operation)
+	if !ok {
 		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
 		return
 	}
-	s.jobReply(resp, j, s.stateOf(j))
+	resp.Job = jobAttrs(job)
 }
 
-func (s *Server) cancelJob(ctx context.Context, req goipp.Message, resp *goipp.Message) {
-	id, _ := intAttr(req.Operation, "job-id")
-	s.mu.Lock()
-	j := s.jobs[id]
-	s.mu.Unlock()
-	if j == nil {
-		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
-		return
+func (s *Server) getJobs(req goipp.Message, resp *goipp.Message) {
+	which := WhichActive
+	if v, ok := strAttr(req.Operation, "which-jobs"); ok {
+		switch v {
+		case "completed":
+			which = WhichFinished
+		case "all":
+			which = WhichAll
+		}
 	}
-	if j.spoolerID != "" {
-		_ = s.backend.Cancel(ctx, j.spoolerID)
+	printer := ""
+	if uri, ok := strAttr(req.Operation, "printer-uri"); ok {
+		printer = queueName(uri)
 	}
-}
+	limit, _ := intAttr(req.Operation, "limit")
 
-func (s *Server) getJobs(resp *goipp.Message) {
-	s.mu.Lock()
-	jobs := make([]*compatJob, 0, len(s.jobs))
-	for _, j := range s.jobs {
-		jobs = append(jobs, j)
-	}
-	s.mu.Unlock()
-
+	jobs := s.backend.Jobs(printer, which)
 	groups := goipp.Groups{{Tag: goipp.TagOperationGroup, Attrs: resp.Operation}}
-	for _, j := range jobs {
-		groups = append(groups, goipp.Group{Tag: goipp.TagJobGroup, Attrs: jobAttrs(j, s.stateOf(j))})
+	for i, j := range jobs {
+		if limit > 0 && i >= limit {
+			break
+		}
+		groups = append(groups, goipp.Group{Tag: goipp.TagJobGroup, Attrs: jobAttrs(j)})
 	}
 	resp.Groups = groups
 }
 
-// --- job bookkeeping ---
-
-func (s *Server) newJob(printer string, ticket model.JobTicket, name string) *compatJob {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.counter++
-	j := &compatJob{id: s.counter, printer: printer, ticket: ticket, name: name}
-	s.jobs[j.id] = j
-	return j
+func (s *Server) jobAction(ctx context.Context, req goipp.Message, resp *goipp.Message, action string) {
+	job, ok := s.lookup(req.Operation)
+	if !ok {
+		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
+		return
+	}
+	if action == ActionCancel {
+		s.mu.Lock()
+		delete(s.incoming, job.Number)
+		s.mu.Unlock()
+	}
+	if err := s.backend.JobAction(ctx, job.Number, action); err != nil {
+		s.fail(resp, err)
+	}
 }
 
-func (s *Server) submit(ctx context.Context, j *compatJob, doc io.Reader) error {
-	id, err := s.backend.Submit(ctx, j.printer, j.name, j.ticket, doc)
-	if err != nil {
-		return err
+// setJobAttributes handles the hold and release requests of lp -H.
+func (s *Server) setJobAttributes(ctx context.Context, req goipp.Message, resp *goipp.Message) {
+	hold, ok := strAttr(req.Job, "job-hold-until")
+	if !ok {
+		return
 	}
-	s.mu.Lock()
-	j.spoolerID = id
-	s.mu.Unlock()
-	return nil
+	action := ActionHold
+	if hold == "no-hold" {
+		action = ActionRelease
+	}
+	s.jobAction(ctx, req, resp, action)
 }
 
-func (s *Server) stateOf(j *compatJob) model.JobState {
-	s.mu.Lock()
-	id := j.spoolerID
-	s.mu.Unlock()
-	if id == "" {
-		return model.JobPending
+func (s *Server) cancelAll(ctx context.Context, req goipp.Message, resp *goipp.Message) {
+	printer := ""
+	if uri, ok := strAttr(req.Operation, "printer-uri"); ok {
+		printer = queueName(uri)
 	}
-	if st, ok := s.backend.JobState(id); ok {
-		return st
+	for _, j := range s.backend.Jobs(printer, WhichActive) {
+		_ = s.backend.JobAction(ctx, j.Number, ActionCancel)
 	}
-	return model.JobPending
 }
 
-func (s *Server) jobReply(resp *goipp.Message, j *compatJob, state model.JobState) {
-	resp.Job = jobAttrs(j, state)
+func (s *Server) change(ctx context.Context, req goipp.Message, resp *goipp.Message, c PrinterChange) {
+	name := s.targetName(req.Operation)
+	if _, ok := s.backend.PrinterByName(name); !ok {
+		resp.Code = goipp.Code(goipp.StatusErrorNotFound)
+		return
+	}
+	if err := s.backend.AddOrModifyPrinter(ctx, name, c); err != nil {
+		s.fail(resp, err)
+	}
+}
+
+func (s *Server) addModifyPrinter(ctx context.Context, req goipp.Message, resp *goipp.Message) {
+	name := s.targetName(req.Operation)
+	if name == "" {
+		resp.Code = goipp.Code(goipp.StatusErrorBadRequest)
+		return
+	}
+	attrs := req.Printer
+	c := PrinterChange{}
+	if v, ok := strAttr(attrs, "device-uri"); ok {
+		c.URI = &v
+	}
+	if v, ok := strAttr(attrs, "printer-info"); ok {
+		c.Info = &v
+	}
+	if v, ok := strAttr(attrs, "printer-location"); ok {
+		c.Location = &v
+	}
+	if v, ok := boolAttr(attrs, "printer-is-shared"); ok {
+		c.Shared = &v
+	}
+	if v, ok := boolAttr(attrs, "printer-is-accepting-jobs"); ok {
+		c.Accepting = &v
+	}
+	if v, ok := intAttr(attrs, "printer-state"); ok {
+		c.Paused = ptr(v == 5)
+	}
+	c.Defaults.Media, _ = strAttr(attrs, "media-default")
+	c.Defaults.Sides, _ = strAttr(attrs, "sides-default")
+	c.Defaults.Color, _ = strAttr(attrs, "print-color-mode-default")
+	c.Defaults.Quality, _ = intAttr(attrs, "print-quality-default")
+	c.Defaults.Copies, _ = intAttr(attrs, "copies-default")
+	if err := s.backend.AddOrModifyPrinter(ctx, name, c); err != nil {
+		s.fail(resp, err)
+	}
+}
+
+func (s *Server) deletePrinter(req goipp.Message, resp *goipp.Message) {
+	if err := s.backend.DeletePrinter(s.targetName(req.Operation)); err != nil {
+		s.fail(resp, err)
+	}
+}
+
+func (s *Server) setDefault(req goipp.Message, resp *goipp.Message) {
+	if err := s.backend.SetDefault(s.targetName(req.Operation)); err != nil {
+		s.fail(resp, err)
+	}
+}
+
+func (s *Server) getDevices(ctx context.Context, resp *goipp.Message) {
+	groups := goipp.Groups{{Tag: goipp.TagOperationGroup, Attrs: resp.Operation}}
+	for _, d := range s.backend.Devices(ctx) {
+		var a goipp.Attributes
+		a.Add(goipp.MakeAttribute("device-class", goipp.TagKeyword, goipp.String(d.Class)))
+		a.Add(goipp.MakeAttribute("device-info", goipp.TagText, goipp.String(d.Info)))
+		a.Add(goipp.MakeAttribute("device-make-and-model", goipp.TagText, goipp.String(d.MakeModel)))
+		a.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(d.URI)))
+		a.Add(goipp.MakeAttribute("device-id", goipp.TagText, goipp.String("")))
+		a.Add(goipp.MakeAttribute("device-location", goipp.TagText, goipp.String(d.Location)))
+		groups = append(groups, goipp.Group{Tag: goipp.TagPrinterGroup, Attrs: a})
+	}
+	resp.Groups = groups
+}
+
+// getPPDs offers the single "driver" every Torchio queue uses.
+func (s *Server) getPPDs(resp *goipp.Message) {
+	var a goipp.Attributes
+	a.Add(goipp.MakeAttribute("ppd-name", goipp.TagName, goipp.String("everywhere")))
+	a.Add(goipp.MakeAttribute("ppd-make", goipp.TagText, goipp.String("Generic")))
+	a.Add(goipp.MakeAttribute("ppd-make-and-model", goipp.TagText, goipp.String("IPP Everywhere")))
+	a.Add(goipp.MakeAttribute("ppd-natural-language", goipp.TagLanguage, goipp.String("en")))
+	resp.Groups = goipp.Groups{
+		{Tag: goipp.TagOperationGroup, Attrs: resp.Operation},
+		{Tag: goipp.TagPrinterGroup, Attrs: a},
+	}
 }
 
 func (s *Server) fail(resp *goipp.Message, err error) {
-	resp.Code = goipp.Code(goipp.StatusErrorInternal)
+	status := goipp.StatusErrorInternal
+	switch {
+	case errors.Is(err, ErrNotFound):
+		status = goipp.StatusErrorNotFound
+	case errors.Is(err, ErrNotPossible):
+		status = goipp.StatusErrorNotPossible
+	}
+	resp.Code = goipp.Code(status)
 	resp.Operation.Add(goipp.MakeAttribute("status-message", goipp.TagText, goipp.String(err.Error())))
+}
+
+// targetName is the queue an administrative request is about.
+func (s *Server) targetName(op goipp.Attributes) string {
+	if uri, ok := strAttr(op, "printer-uri"); ok {
+		if name := queueName(uri); name != "" {
+			return name
+		}
+	}
+	name, _ := strAttr(op, "printer-name")
+	return name
 }
 
 // resolvePrinter finds the target printer from the request: the queue name in
@@ -321,29 +557,25 @@ func queueName(uri string) string {
 	p := strings.TrimPrefix(u.Path, "/")
 	for _, pfx := range []string{"printers/", "classes/"} {
 		if strings.HasPrefix(p, pfx) {
-			return strings.TrimPrefix(p, pfx)
+			name, _ := url.PathUnescape(strings.TrimPrefix(p, pfx))
+			return name
 		}
 	}
 	return ""
 }
 
-// Idle reports whether any compat jobs are still active (used by graceful
-// shutdown decisions; cheap and best-effort).
-func (s *Server) Idle() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, j := range s.jobs {
-		if !s.spoolerTerminal(j) {
-			return false
+// jobNumber extracts the job id from ipp://localhost/jobs/N.
+func jobNumber(uri string) int {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, c := range strings.TrimPrefix(u.Path, "/jobs/") {
+		if c < '0' || c > '9' {
+			return 0
 		}
+		n = n*10 + int(c-'0')
 	}
-	return true
-}
-
-func (s *Server) spoolerTerminal(j *compatJob) bool {
-	if j.spoolerID == "" {
-		return false
-	}
-	st, ok := s.backend.JobState(j.spoolerID)
-	return ok && st.IsTerminal()
+	return n
 }

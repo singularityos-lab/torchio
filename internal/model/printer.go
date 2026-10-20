@@ -35,6 +35,45 @@ type Printer struct {
 	// libcups clients see exactly what the real printer advertises.
 	RawAttrs []byte
 
+	Queue QueueSettings
+
 	Created time.Time
 	Updated time.Time
+}
+
+// QueueSettings is what a user configures on a queue, as opposed to what the
+// printer reports about itself.
+type QueueSettings struct {
+	Info     string
+	Location string
+	// Paused keeps jobs queued without sending them.
+	Paused bool
+	// Message says why the queue is paused.
+	Message string
+	// Rejecting refuses new jobs.
+	Rejecting bool
+	Shared    bool
+	// Defaults fills ticket fields a job leaves empty.
+	Defaults JobTicket
+}
+
+// Ticket returns t with the queue defaults applied to its empty fields.
+func (q QueueSettings) Ticket(t JobTicket) JobTicket {
+	d := q.Defaults
+	if t.Copies == 0 {
+		t.Copies = d.Copies
+	}
+	if t.Sides == "" {
+		t.Sides = d.Sides
+	}
+	if t.Media == "" {
+		t.Media = d.Media
+	}
+	if t.Color == "" {
+		t.Color = d.Color
+	}
+	if t.Quality == 0 {
+		t.Quality = d.Quality
+	}
+	return t
 }

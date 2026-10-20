@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/OpenPrinting/goipp"
-	"github.com/mirkobrombin/go-foundation/pkg/events"
 
 	"github.com/singularityos-lab/torchio/internal/ipp"
 	"github.com/singularityos-lab/torchio/internal/portal"
@@ -62,7 +61,7 @@ func startDaemon(t *testing.T, tr queue.Transport, trust portal.Portal) (*Client
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng := queue.New(queue.Config{Store: st, Spool: sp, Bus: events.New(), Transport: tr})
+	eng := queue.New(queue.Config{Store: st, Spool: sp, Transport: tr})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)

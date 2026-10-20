@@ -8,14 +8,20 @@ import (
 
 // AppendEvent writes one entry to a job's append-only history. The sequence
 // number is assigned here as max(seq)+1 for the job, so callers do not race on
-// it. This is the data behind `torchio queue history`.
+// it.
 func (s *Store) AppendEvent(e *model.Event) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	if err := appendEvent(tx, e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
 
+func appendEvent(tx execer, e *model.Event) error {
 	var next int64
 	// COALESCE handles the first event for a job (no rows yet).
 	if err := tx.QueryRow(
@@ -32,7 +38,7 @@ func (s *Store) AppendEvent(e *model.Event) error {
 		string(e.From), string(e.To), e.Actor, e.Cause); err != nil {
 		return fmt.Errorf("store: append event: %w", err)
 	}
-	return tx.Commit()
+	return nil
 }
 
 // JobEvents returns a job's history in order.

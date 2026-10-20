@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/singularityos-lab/torchio/internal/ipp"
+	"github.com/singularityos-lab/torchio/internal/admin"
 	"github.com/singularityos-lab/torchio/internal/model"
 	"github.com/singularityos-lab/torchio/internal/portal"
 	"github.com/singularityos-lab/torchio/internal/queue"
@@ -19,7 +19,7 @@ import (
 type Service struct {
 	store  *store.Store
 	engine *queue.Engine
-	prober *ipp.Client
+	admin  *admin.Admin
 	portal portal.Portal
 }
 
@@ -30,7 +30,7 @@ func NewService(st *store.Store, eng *queue.Engine, p portal.Portal) *Service {
 	if p == nil {
 		p = portal.AlwaysDeny{}
 	}
-	return &Service{store: st, engine: eng, prober: ipp.NewClient(), portal: p}
+	return &Service{store: st, engine: eng, admin: admin.New(st, eng), portal: p}
 }
 
 // ctx returns a bounded context for an RPC call. net/rpc has no per-call
@@ -41,40 +41,12 @@ func (s *Service) ctx() (context.Context, context.CancelFunc) {
 
 // AddPrinter probes a printer's capabilities, persists it and starts its actor.
 func (s *Service) AddPrinter(args AddPrinterArgs, reply *PrinterReply) error {
-	if args.Name == "" || args.URI == "" {
-		return fmt.Errorf("name and uri are required")
-	}
 	ctx, cancel := s.ctx()
 	defer cancel()
-
-	msg, err := s.prober.GetPrinterAttributes(ctx, args.URI)
+	p, err := s.admin.Add(ctx, args.Name, args.URI, model.OriginManual, args.MakeDefault)
 	if err != nil {
-		return fmt.Errorf("probe %s: %w", args.URI, err)
+		return err
 	}
-	caps := ipp.ParseCapabilities(msg)
-	raw, _ := msg.EncodeBytes()
-
-	now := time.Now()
-	p := &model.Printer{
-		ID:       model.NewID(),
-		Name:     args.Name,
-		URI:      args.URI,
-		Origin:   model.OriginManual,
-		Default:  args.MakeDefault,
-		Caps:     caps,
-		RawAttrs: raw,
-		Created:  now,
-		Updated:  now,
-	}
-	if err := s.store.SavePrinter(p); err != nil {
-		return fmt.Errorf("save printer: %w", err)
-	}
-	if args.MakeDefault {
-		if err := s.store.SetDefaultPrinter(p.ID); err != nil {
-			return err
-		}
-	}
-	s.engine.AddPrinter(p)
 	reply.Printer = toPrinterDTO(p)
 	return nil
 }
@@ -93,20 +65,12 @@ func (s *Service) ListPrinters(_ Empty, reply *PrintersReply) error {
 
 // RemovePrinter deletes a printer (and its jobs, via cascade).
 func (s *Service) RemovePrinter(args NameArgs, _ *Empty) error {
-	p, err := s.store.GetPrinterByName(args.Name)
-	if err != nil {
-		return err
-	}
-	return s.store.DeletePrinter(p.ID)
+	return s.admin.Remove(args.Name)
 }
 
 // SetDefault marks a printer as the default by name.
 func (s *Service) SetDefault(args NameArgs, _ *Empty) error {
-	p, err := s.store.GetPrinterByName(args.Name)
-	if err != nil {
-		return err
-	}
-	return s.store.SetDefaultPrinter(p.ID)
+	return s.admin.SetDefault(args.Name)
 }
 
 // Submit sends a document to a printer through the spooler.

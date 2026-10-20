@@ -1,22 +1,15 @@
-// Command torchio is the single static multi-call binary for the Torchio print
-// system. Depending on argv[0] or the first argument it acts as
-// the spooler daemon, a print client, a queue manager, a diagnostics tool or a
-// legacy-driver host. The lp/lpr/lpstat compatibility shims are symlinks to
-// this binary that dispatch on the program name.
+// Command torchio is the client of the torchio print system. Installed as lp,
+// lpr or lpstat it accepts the common forms of those commands.
 package main
 
 import (
 	"fmt"
 	"os"
 
-	"github.com/mirkobrombin/go-foundation/pkg/errutil"
-
 	"github.com/singularityos-lab/torchio/internal/cli"
 )
 
 func main() {
-	defer errutil.Auto()
-
 	if err := cli.Dispatch(os.Args); err != nil {
 		fmt.Fprintln(os.Stderr, "torchio:", err)
 		os.Exit(1)

@@ -1,7 +1,6 @@
-// Package control is the daemon's control plane: a small JSON-RPC service over
-// a Unix domain socket, driven by the CLI. It uses net/rpc with the JSON codec
-// to stay dependency free. The DTOs here are the wire shapes;
-// they intentionally avoid leaking model types (model.ID is a byte array that
+// Package control is the daemon's control plane: net/rpc with the JSON codec
+// over a Unix domain socket, driven by the CLI. The DTOs here are the wire
+// shapes; they avoid leaking model types (model.ID is a byte array that
 // JSON would render as a number array, so IDs cross the wire as their ULID
 // strings).
 package control

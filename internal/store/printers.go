@@ -19,18 +19,23 @@ func (s *Store) SavePrinter(p *model.Printer) error {
 	if p.Default {
 		def = 1
 	}
+	queue, err := json.Marshal(p.Queue)
+	if err != nil {
+		return fmt.Errorf("store: marshal queue: %w", err)
+	}
 	raw := p.RawAttrs
 	if raw == nil {
 		raw = []byte{} // a nil BLOB would violate the NOT NULL column
 	}
 	_, err = s.db.Exec(`
-		INSERT INTO printers (id, name, uri, origin, is_default, caps_json, attrs_raw, created_ms, updated_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO printers (id, name, uri, origin, is_default, caps_json, attrs_raw, queue_json, created_ms, updated_ms)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, uri=excluded.uri, origin=excluded.origin,
 			is_default=excluded.is_default, caps_json=excluded.caps_json,
-			attrs_raw=excluded.attrs_raw, updated_ms=excluded.updated_ms`,
-		p.ID.String(), p.Name, p.URI, string(p.Origin), def, string(caps), raw,
+			attrs_raw=excluded.attrs_raw, queue_json=excluded.queue_json,
+			updated_ms=excluded.updated_ms`,
+		p.ID.String(), p.Name, p.URI, string(p.Origin), def, string(caps), raw, string(queue),
 		toMs(p.Created), toMs(p.Updated))
 	if err != nil {
 		return fmt.Errorf("store: save printer: %w", err)
@@ -104,7 +109,7 @@ func (s *Store) SetDefaultPrinter(id model.ID) error {
 }
 
 // printerCols is the shared SELECT prefix for printers.
-const printerCols = `SELECT id, name, uri, origin, is_default, caps_json, attrs_raw, created_ms, updated_ms FROM printers`
+const printerCols = `SELECT id, name, uri, origin, is_default, caps_json, attrs_raw, queue_json, created_ms, updated_ms FROM printers`
 
 // rowScanner abstracts *sql.Row and *sql.Rows so scan helpers serve both.
 type rowScanner interface {
@@ -114,11 +119,12 @@ type rowScanner interface {
 func (s *Store) scanPrinter(row rowScanner) (*model.Printer, error) {
 	var (
 		idStr, name, uri, origin, capsJSON string
+		queueJSON                          string
 		rawAttrs                           []byte
 		def                                int
 		createdMs, updatedMs               int64
 	)
-	if err := row.Scan(&idStr, &name, &uri, &origin, &def, &capsJSON, &rawAttrs, &createdMs, &updatedMs); err != nil {
+	if err := row.Scan(&idStr, &name, &uri, &origin, &def, &capsJSON, &rawAttrs, &queueJSON, &createdMs, &updatedMs); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -140,6 +146,9 @@ func (s *Store) scanPrinter(row rowScanner) (*model.Printer, error) {
 	}
 	if err := json.Unmarshal([]byte(capsJSON), &p.Caps); err != nil {
 		return nil, fmt.Errorf("store: corrupt caps for %q: %w", name, err)
+	}
+	if err := json.Unmarshal([]byte(queueJSON), &p.Queue); err != nil {
+		return nil, fmt.Errorf("store: corrupt queue settings for %q: %w", name, err)
 	}
 	return p, nil
 }

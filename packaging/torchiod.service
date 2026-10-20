@@ -1,0 +1,15 @@
+[Unit]
+Description=Torchio print spooler
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/torchiod
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%S/torchio %t/torchio
+
+[Install]
+WantedBy=default.target

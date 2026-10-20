@@ -1,7 +1,5 @@
-// Package cli implements the multi-call dispatch for the torchio binary
-// The same executable is reachable as `torchio <subcommand>`
-// or through the lp/lpr/lpstat symlinks; this package maps both onto the
-// internal subcommands.
+// Package cli implements the torchio client. The same executable answers as
+// `torchio <subcommand>` and, through symlinks, as lp, lpr and lpstat.
 package cli
 
 import (
@@ -13,18 +11,15 @@ import (
 	"syscall"
 )
 
-// command is one entry of the multi-call binary.
 type command struct {
 	name    string
 	summary string
 	run     func(ctx context.Context, args []string) error
 }
 
-// commands is the registry of torchio subcommands, keyed by name.
 var commands = map[string]command{
 	"print":    {"print", "send a document to an IPP printer (passthrough)", runPrint},
 	"printer":  {"printer", "add, list, remove, probe and set default printers", runPrinter},
-	"daemon":   {"daemon", "run the per-user spooler (torchiod)", runDaemon},
 	"queue":    {"queue", "list, cancel and inspect jobs", runQueue},
 	"discover": {"discover", "list and confirm printers found on the network", runDiscover},
 	"doctor":   {"doctor", "end-to-end diagnostics of the print path", runDoctor},
@@ -34,21 +29,16 @@ var commands = map[string]command{
 	"scan":     {"scan", "scan a page from a network (eSCL/AirScan) scanner", runScan},
 }
 
-// shims maps the legacy program names (when invoked via symlink) to a torchio
-// subcommand. They translate the sane subset of historical options.
+// shims maps the program name, when invoked through a symlink, to a subcommand.
 var shims = map[string]string{
 	"lp":     "print",
 	"lpr":    "print",
 	"lpstat": "queue",
 }
 
-// Dispatch routes os.Args to the right subcommand. It resolves the legacy
-// shims first (by argv[0]), then the explicit `torchio <subcommand>` form. It
-// installs a context cancelled on SIGINT/SIGTERM so in-flight prints abort
-// cleanly.
+// Dispatch routes os.Args to a subcommand, by program name first and then by
+// the first argument. In-flight prints abort on SIGINT and SIGTERM.
 func Dispatch(args []string) error {
-	// Catch SIGINT (Ctrl-C) and SIGTERM (systemd stop) so the daemon shuts
-	// down cleanly and removes its socket.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -77,18 +67,15 @@ func Dispatch(args []string) error {
 	return cmd.run(ctx, args[2:])
 }
 
-// usage prints the multi-call command list in a fixed order.
 func usage() error {
-	fmt.Println("torchio: a modern, IPP-only print system")
-	fmt.Println()
 	fmt.Println("usage: torchio <subcommand> [args]")
 	fmt.Println()
 	fmt.Println("subcommands:")
-	for _, name := range []string{"print", "printer", "daemon", "queue", "discover", "doctor", "usb", "host", "share", "scan"} {
+	for _, name := range []string{"print", "printer", "queue", "discover", "doctor", "usb", "host", "share", "scan"} {
 		c := commands[name]
 		fmt.Printf("  %-9s %s\n", c.name, c.summary)
 	}
 	fmt.Println()
-	fmt.Println("compatibility shims (via symlink): lp, lpr -> print; lpstat -> queue")
+	fmt.Println("installed as lp or lpr it prints; as lpstat it lists jobs")
 	return nil
 }

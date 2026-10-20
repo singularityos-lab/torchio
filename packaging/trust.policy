@@ -1,7 +1,7 @@
 # Torchio declarative trust policy.
 #
 # Used by the "policy" trust backend:
-#   TORCHIO_TRUST_BACKEND=policy torchio daemon
+#   TORCHIO_TRUST_BACKEND=policy torchiod
 # Default location: $XDG_CONFIG_HOME/torchio/trust.policy
 # Override with:    TORCHIO_TRUST_POLICY=/path/to/trust.policy
 #

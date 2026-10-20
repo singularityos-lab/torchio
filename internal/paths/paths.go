@@ -1,6 +1,6 @@
 // Package paths resolves the per-user locations Torchio uses, following the XDG
 // base directory spec. State (the SQLite database and the spool) lives under
-// XDG_STATE_HOME; the control socket lives under XDG_RUNTIME_DIR.
+// XDG_STATE_HOME; the sockets live under XDG_RUNTIME_DIR.
 package paths
 
 import (

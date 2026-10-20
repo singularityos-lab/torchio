@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=Print Spooler
+Exec=/usr/bin/torchiod
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

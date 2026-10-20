@@ -1,7 +1,10 @@
 package cupscompat
 
 import (
+	"net/url"
+	"os/user"
 	"strconv"
+	"time"
 
 	"github.com/OpenPrinting/goipp"
 
@@ -34,7 +37,7 @@ func opAttrs(m *goipp.Message) {
 // printerAttrs builds the attribute set for one printer, in the shape libcups
 // (cupsGetDests) and the GTK/Qt print dialogs expect. The queue URI uses the
 // CUPS local form ipp://localhost/printers/NAME.
-func printerAttrs(p model.Printer) goipp.Attributes {
+func printerAttrs(p model.Printer, queued int) goipp.Attributes {
 	// Preferred path: replay the real printer's full IPP attribute set, with the
 	// queue-specific attributes overridden. This is what makes libcups clients
 	// (Chromium's CUPS-IPP backend, Qt) accept the printer: they see the exact
@@ -43,12 +46,12 @@ func printerAttrs(p model.Printer) goipp.Attributes {
 	if len(p.RawAttrs) > 0 {
 		var msg goipp.Message
 		if err := msg.DecodeBytes(p.RawAttrs); err == nil && len(msg.Printer) > 0 {
-			return overrideQueueAttrs(msg.Printer, p)
+			return overrideQueueAttrs(msg.Printer, p, queued)
 		}
 	}
 
 	var a goipp.Attributes
-	queueURI := "ipp://localhost/printers/" + p.Name
+	queueURI := queueURI(p.Name)
 
 	add := func(name string, tag goipp.Tag, vals ...goipp.Value) {
 		if len(vals) > 0 {
@@ -64,13 +67,8 @@ func printerAttrs(p model.Printer) goipp.Attributes {
 	add("printer-uri-supported", goipp.TagURI, goipp.String(queueURI))
 	add("uri-authentication-supported", goipp.TagKeyword, goipp.String("none"))
 	add("uri-security-supported", goipp.TagKeyword, goipp.String("none"))
-	add("printer-info", goipp.TagText, goipp.String(p.Name))
-	add("printer-location", goipp.TagText, goipp.String(""))
 	add("printer-make-and-model", goipp.TagText, goipp.String(model0))
 	add("device-uri", goipp.TagURI, goipp.String(p.URI))
-	add("printer-state", goipp.TagEnum, goipp.Integer(printerState(p)))
-	add("printer-state-reasons", goipp.TagKeyword, goipp.String("none"))
-	add("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(true))
 	add("printer-type", goipp.TagEnum, goipp.Integer(printerType(p)))
 	add("ipp-versions-supported", goipp.TagKeyword, goipp.String("1.1"), goipp.String("2.0"))
 	add("charset-configured", goipp.TagCharset, goipp.String("utf-8"))
@@ -90,13 +88,65 @@ func printerAttrs(p model.Printer) goipp.Attributes {
 	addKeywords(&a, "sides-supported", p.Caps.Sides)
 	addKeywords(&a, "sides-default", firstOf(p.Caps.Sides))
 	addKeywords(&a, "print-color-mode-supported", p.Caps.ColorModes)
+	for _, at := range queueAttrs(p, p.Name, queued) {
+		a.Add(at)
+	}
 	return a
+}
+
+// queueAttrs describes the queue's own state and settings, which override
+// whatever the device reports.
+func queueAttrs(p model.Printer, info string, queued int) goipp.Attributes {
+	var a goipp.Attributes
+	if p.Queue.Info != "" {
+		info = p.Queue.Info
+	}
+	state, reason, message := printerState(p), "none", ""
+	if p.Queue.Paused {
+		state, reason, message = 5, "paused", p.Queue.Message
+		if message == "" {
+			message = "Paused"
+		}
+	}
+	a.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(info)))
+	a.Add(goipp.MakeAttribute("printer-location", goipp.TagText, goipp.String(p.Queue.Location)))
+	a.Add(goipp.MakeAttribute("printer-state", goipp.TagEnum, goipp.Integer(state)))
+	a.Add(goipp.MakeAttribute("printer-state-reasons", goipp.TagKeyword, goipp.String(reason)))
+	a.Add(goipp.MakeAttribute("printer-state-message", goipp.TagText, goipp.String(message)))
+	a.Add(goipp.MakeAttribute("printer-state-change-time", goipp.TagInteger, goipp.Integer(p.Updated.Unix())))
+	a.Add(goipp.MakeAttribute("printer-up-time", goipp.TagInteger, goipp.Integer(time.Now().Unix())))
+	a.Add(goipp.MakeAttribute("printer-is-accepting-jobs", goipp.TagBoolean, goipp.Boolean(!p.Queue.Rejecting)))
+	a.Add(goipp.MakeAttribute("printer-is-shared", goipp.TagBoolean, goipp.Boolean(p.Queue.Shared)))
+	a.Add(goipp.MakeAttribute("printer-is-temporary", goipp.TagBoolean, goipp.Boolean(false)))
+	a.Add(goipp.MakeAttribute("queued-job-count", goipp.TagInteger, goipp.Integer(queued)))
+	d := p.Queue.Defaults
+	if d.Media != "" {
+		a.Add(goipp.MakeAttribute("media-default", goipp.TagKeyword, goipp.String(d.Media)))
+	}
+	if d.Sides != "" {
+		a.Add(goipp.MakeAttribute("sides-default", goipp.TagKeyword, goipp.String(d.Sides)))
+	}
+	if d.Color != "" {
+		a.Add(goipp.MakeAttribute("print-color-mode-default", goipp.TagKeyword, goipp.String(d.Color)))
+	}
+	if d.Quality != 0 {
+		a.Add(goipp.MakeAttribute("print-quality-default", goipp.TagEnum, goipp.Integer(d.Quality)))
+	}
+	if d.Copies != 0 {
+		a.Add(goipp.MakeAttribute("copies-default", goipp.TagInteger, goipp.Integer(d.Copies)))
+	}
+	return a
+}
+
+func queueURI(name string) string {
+	return "ipp://localhost/printers/" + url.PathEscape(name)
 }
 
 // overrideQueueAttrs takes the backend printer's real attributes and replaces
 // the few that must describe the CUPS queue instead of the backend device, so
 // clients submit jobs to Torchio (the queue), not directly to the printer.
-func overrideQueueAttrs(real goipp.Attributes, p model.Printer) goipp.Attributes {
+func overrideQueueAttrs(real goipp.Attributes, p model.Printer, queued int) goipp.Attributes {
+	queue := queueAttrs(p, displayName(real, p), queued)
 	override := map[string]bool{
 		"printer-name":                 true,
 		"printer-uri-supported":        true,
@@ -108,20 +158,24 @@ func overrideQueueAttrs(real goipp.Attributes, p model.Printer) goipp.Attributes
 		"device-uri":                   true,
 		"printer-type":                 true,
 	}
+	for _, at := range queue {
+		override[at.Name] = true
+	}
 	var out goipp.Attributes
 	for _, attr := range real {
 		if !override[attr.Name] {
 			out.Add(attr)
 		}
 	}
-	queueURI := "ipp://localhost/printers/" + p.Name
 	out.Add(goipp.MakeAttribute("printer-name", goipp.TagName, goipp.String(p.Name)))
-	out.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(queueURI)))
+	out.Add(goipp.MakeAttribute("printer-uri-supported", goipp.TagURI, goipp.String(queueURI(p.Name))))
 	out.Add(goipp.MakeAttribute("uri-authentication-supported", goipp.TagKeyword, goipp.String("none")))
 	out.Add(goipp.MakeAttribute("uri-security-supported", goipp.TagKeyword, goipp.String("none")))
-	out.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String(displayName(real, p))))
 	out.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String(p.URI)))
 	out.Add(goipp.MakeAttribute("printer-type", goipp.TagEnum, goipp.Integer(printerType(p))))
+	for _, at := range queue {
+		out.Add(at)
+	}
 	return out
 }
 
@@ -143,17 +197,53 @@ func displayName(real goipp.Attributes, p model.Printer) string {
 }
 
 // jobAttrs builds the attribute set for one job.
-func jobAttrs(j *compatJob, state model.JobState) goipp.Attributes {
+func jobAttrs(j Job) goipp.Attributes {
 	var a goipp.Attributes
-	a.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(j.id)))
-	a.Add(goipp.MakeAttribute("job-uri", goipp.TagURI, goipp.String("ipp://localhost/jobs/"+strconv.Itoa(j.id))))
-	a.Add(goipp.MakeAttribute("job-printer-uri", goipp.TagURI, goipp.String("ipp://localhost/printers/"+j.printer)))
-	if j.name != "" {
-		a.Add(goipp.MakeAttribute("job-name", goipp.TagName, goipp.String(j.name)))
+	add := func(name string, tag goipp.Tag, v goipp.Value) { a.Add(goipp.MakeAttribute(name, tag, v)) }
+	add("job-id", goipp.TagInteger, goipp.Integer(j.Number))
+	add("job-uri", goipp.TagURI, goipp.String("ipp://localhost/jobs/"+strconv.Itoa(j.Number)))
+	add("job-printer-uri", goipp.TagURI, goipp.String(queueURI(j.Printer)))
+	add("job-name", goipp.TagName, goipp.String(j.Name))
+	add("job-originating-user-name", goipp.TagName, goipp.String(userName()))
+	add("job-state", goipp.TagEnum, goipp.Integer(ippJobState(j.State)))
+	reason := j.Reason
+	if reason == "" {
+		reason = jobReason(j.State)
 	}
-	a.Add(goipp.MakeAttribute("job-state", goipp.TagEnum, goipp.Integer(ippJobState(state))))
-	a.Add(goipp.MakeAttribute("job-state-reasons", goipp.TagKeyword, goipp.String("none")))
+	add("job-state-reasons", goipp.TagKeyword, goipp.String(reason))
+	add("job-k-octets", goipp.TagInteger, goipp.Integer((j.Size+1023)/1024))
+	add("time-at-creation", goipp.TagInteger, goipp.Integer(j.Created.Unix()))
+	if ippJobState(j.State) >= ippJobProcessing {
+		add("time-at-processing", goipp.TagInteger, goipp.Integer(j.Updated.Unix()))
+	}
+	if j.State.IsTerminal() {
+		add("time-at-completed", goipp.TagInteger, goipp.Integer(j.Updated.Unix()))
+	}
 	return a
+}
+
+func jobReason(s model.JobState) string {
+	switch s {
+	case model.JobHeld:
+		return "job-hold-until-specified"
+	case model.JobCompleted:
+		return "job-completed-successfully"
+	case model.JobCanceled:
+		return "job-canceled-by-user"
+	case model.JobAborted:
+		return "aborted-by-system"
+	case model.JobTransforming, model.JobSpooled, model.JobSending:
+		return "job-printing"
+	default:
+		return "none"
+	}
+}
+
+func userName() string {
+	if u, err := user.Current(); err == nil {
+		return u.Username
+	}
+	return "user"
 }
 
 func printerState(p model.Printer) int {
@@ -210,6 +300,12 @@ func ticketFrom(req goipp.Message) model.JobTicket {
 	}
 	if v, ok := strAttr(req.Job, "print-color-mode"); ok {
 		t.Color = v
+	}
+	if v, ok := intAttr(req.Job, "print-quality"); ok {
+		t.Quality = v
+	}
+	if v, ok := strAttr(req.Job, "job-hold-until"); ok && v != "no-hold" {
+		t.Hold = true
 	}
 	return t
 }

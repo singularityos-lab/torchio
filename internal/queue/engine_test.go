@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -11,8 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/mirkobrombin/go-foundation/pkg/events"
 
 	"github.com/singularityos-lab/torchio/internal/detect"
 	"github.com/singularityos-lab/torchio/internal/ipp"
@@ -69,7 +68,7 @@ func harness(t *testing.T, tr Transport) (*Engine, *store.Store) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eng := New(Config{Store: st, Spool: sp, Bus: events.New(), Transport: tr})
+	eng := New(Config{Store: st, Spool: sp, Transport: tr})
 	return eng, st
 }
 
@@ -250,7 +249,7 @@ func TestEngineRasterizesPDFForRasterPrinter(t *testing.T) {
 	pdfium := transform.NewPDFiumTransform(150)
 	t.Cleanup(func() { pdfium.Close() })
 	reg.Register(pdfium)
-	eng := New(Config{Store: st, Spool: sp, Bus: events.New(), Transport: tr, Transforms: reg})
+	eng := New(Config{Store: st, Spool: sp, Transport: tr, Transforms: reg})
 
 	// Printer accepts only PWG raster.
 	now := time.Now()
@@ -391,5 +390,65 @@ func TestEnginePermanentStatusErrorAborts(t *testing.T) {
 	tr.mu.Unlock()
 	if calls != 1 {
 		t.Errorf("permanent error should not retry, got %d calls", calls)
+	}
+}
+
+func TestEnginePauseHoldRelease(t *testing.T) {
+	tr := &fakeTransport{}
+	eng, st := harness(t, tr)
+	p := pdfCapablePrinter(t, st)
+	p.Queue.Paused = true
+	if err := st.SavePrinter(p); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := eng.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer eng.Stop()
+
+	pdf := []byte("%PDF-1.7\nheld\n%%EOF\n")
+	job, err := eng.Submit(ctx, p.ID, "held.pdf", model.JobTicket{}, bytes.NewReader(pdf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, st, job.ID, model.JobPending, 2*time.Second)
+
+	if err := eng.Hold(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, st, job.ID, model.JobHeld, 2*time.Second)
+
+	p.Queue.Paused = false
+	if err := st.SavePrinter(p); err != nil {
+		t.Fatal(err)
+	}
+	eng.PrinterChanged(p)
+	time.Sleep(50 * time.Millisecond)
+	if j, _ := st.GetJob(job.ID); model.JobState(j.State) != model.JobHeld {
+		t.Fatalf("held job moved to %s on resume", j.State)
+	}
+
+	if err := eng.Release(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, st, job.ID, model.JobCompleted, 2*time.Second)
+	if done, _ := st.GetJob(job.ID); done.Number == 0 {
+		t.Error("job has no CUPS number")
+	}
+}
+
+func TestEngineRejectsWhenNotAccepting(t *testing.T) {
+	eng, st := harness(t, &fakeTransport{})
+	p := pdfCapablePrinter(t, st)
+	p.Queue.Rejecting = true
+	if err := st.SavePrinter(p); err != nil {
+		t.Fatal(err)
+	}
+	_, err := eng.Submit(context.Background(), p.ID, "x.pdf", model.JobTicket{}, bytes.NewReader([]byte("%PDF-1.7\n%%EOF\n")))
+	if !errors.Is(err, ErrRejecting) {
+		t.Fatalf("Submit error = %v, want ErrRejecting", err)
 	}
 }

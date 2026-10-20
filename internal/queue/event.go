@@ -2,10 +2,8 @@ package queue
 
 import "github.com/singularityos-lab/torchio/internal/model"
 
-// JobEvent is published on the go-foundation event bus whenever a job changes
-// state. The SQLite event log and the live gRPC stream to the desktop are both
-// just subscribers to this one flow: the daemon does not maintain two parallel
-// notification mechanisms.
+// JobEvent describes one change in a job's history, delivered to the engine's
+// Notify callback.
 type JobEvent struct {
 	JobID     model.ID
 	PrinterID model.ID

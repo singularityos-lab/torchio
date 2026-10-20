@@ -44,13 +44,21 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("store: apply schema: %w", err)
 	}
-	// Lightweight migrations for databases created by an earlier version. These
-	// are best-effort: a "duplicate column" error just means the migration
-	// already ran (or the fresh schema already has the column).
+	// A "duplicate column" error means the column is already there.
 	for _, mig := range []string{
 		`ALTER TABLE printers ADD COLUMN attrs_raw BLOB NOT NULL DEFAULT x''`,
+		`ALTER TABLE printers ADD COLUMN queue_json TEXT NOT NULL DEFAULT '{}'`,
+		`ALTER TABLE jobs ADD COLUMN number INTEGER NOT NULL DEFAULT 0`,
 	} {
 		_, _ = db.Exec(mig)
+	}
+	if _, err := db.Exec(`UPDATE jobs SET number = rowid WHERE number = 0`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: number jobs: %w", err)
+	}
+	if _, err := db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS jobs_by_number ON jobs(number)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store: index jobs: %w", err)
 	}
 	return &Store{db: db}, nil
 }

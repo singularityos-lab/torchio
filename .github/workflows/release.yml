@@ -1,0 +1,34 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build static binaries
+        run: |
+          make static
+          mkdir -p dist
+          install -Dm755 torchio dist/usr/bin/torchio
+          install -Dm755 torchiod dist/usr/bin/torchiod
+          install -Dm644 packaging/torchiod.desktop dist/etc/xdg/autostart/torchiod.desktop
+          install -Dm644 data/usb-quirks.conf dist/usr/share/torchio/usb-quirks.conf
+          install -Dm644 data/drivers/generic-pcl5.json dist/usr/share/torchio/drivers/generic-pcl5.json
+          tar czf "torchio-${GITHUB_REF_NAME}-x86_64.tar.gz" -C dist .
+
+      - name: Attach the binaries to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: torchio-*.tar.gz

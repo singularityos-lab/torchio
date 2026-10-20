@@ -9,17 +9,42 @@ import (
 	"github.com/singularityos-lab/torchio/internal/model"
 )
 
-// SaveJob inserts or updates a job row. The event log is written separately via
-// AppendEvent so state transitions and their history stay distinct concerns.
+// SaveJob inserts or updates a job row without touching its history.
 func (s *Store) SaveJob(j *model.Job) error {
+	return saveJob(s.db, j)
+}
+
+// SaveTransition stores a job's new state together with the history entry that
+// explains it, so a reader never sees a state without its event.
+func (s *Store) SaveTransition(j *model.Job, e *model.Event) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := saveJob(tx, j); err != nil {
+		return err
+	}
+	if err := appendEvent(tx, e); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+type execer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+func saveJob(db execer, j *model.Job) error {
 	ticket, err := json.Marshal(j.Ticket)
 	if err != nil {
 		return fmt.Errorf("store: marshal ticket: %w", err)
 	}
-	_, err = s.db.Exec(`
-		INSERT INTO jobs (id, printer_id, name, state, ticket_json, doc_sha256,
+	_, err = db.Exec(`
+		INSERT INTO jobs (id, number, printer_id, name, state, ticket_json, doc_sha256,
 		                  doc_format, doc_size, remote_job_id, error, created_ms, updated_ms)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, (SELECT COALESCE(MAX(number), 0) + 1 FROM jobs), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name=excluded.name, state=excluded.state, ticket_json=excluded.ticket_json,
 			doc_sha256=excluded.doc_sha256, doc_format=excluded.doc_format,
@@ -31,6 +56,11 @@ func (s *Store) SaveJob(j *model.Job) error {
 	if err != nil {
 		return fmt.Errorf("store: save job: %w", err)
 	}
+	if j.Number == 0 {
+		if err := db.QueryRow(`SELECT number FROM jobs WHERE id = ?`, j.ID.String()).Scan(&j.Number); err != nil {
+			return fmt.Errorf("store: job number: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -39,12 +69,19 @@ func (s *Store) GetJob(id model.ID) (*model.Job, error) {
 	return s.scanJob(s.db.QueryRow(jobCols+` WHERE id = ?`, id.String()))
 }
 
+// GetJobByNumber returns a job by the integer id CUPS clients use.
+func (s *Store) GetJobByNumber(n int) (*model.Job, error) {
+	return s.scanJob(s.db.QueryRow(jobCols+` WHERE number = ?`, n))
+}
+
 // JobFilter narrows ListJobs. Zero-valued fields are ignored.
 type JobFilter struct {
 	PrinterID model.ID
 	State     model.JobState
 	// Active, when true, returns only non-terminal jobs.
 	Active bool
+	// Finished, when true, returns only terminal jobs.
+	Finished bool
 }
 
 // ListJobs returns jobs matching the filter, newest last (creation order).
@@ -61,6 +98,9 @@ func (s *Store) ListJobs(f JobFilter) ([]*model.Job, error) {
 	}
 	if f.Active {
 		q += ` AND state NOT IN ('completed','canceled','aborted')`
+	}
+	if f.Finished {
+		q += ` AND state IN ('completed','canceled','aborted')`
 	}
 	q += ` ORDER BY id`
 
@@ -99,17 +139,18 @@ func (s *Store) ReferencedDigests() (map[string]struct{}, error) {
 	return set, rows.Err()
 }
 
-const jobCols = `SELECT id, printer_id, name, state, ticket_json, doc_sha256, doc_format, doc_size, remote_job_id, error, created_ms, updated_ms FROM jobs`
+const jobCols = `SELECT id, number, printer_id, name, state, ticket_json, doc_sha256, doc_format, doc_size, remote_job_id, error, created_ms, updated_ms FROM jobs`
 
 func (s *Store) scanJob(row rowScanner) (*model.Job, error) {
 	var (
+		number                                       int
 		idStr, printerIDStr, name, state, ticketJSON string
 		docSHA, docFormat, errStr                    string
 		docSize                                      int64
 		remoteJobID                                  int
 		createdMs, updatedMs                         int64
 	)
-	if err := row.Scan(&idStr, &printerIDStr, &name, &state, &ticketJSON,
+	if err := row.Scan(&idStr, &number, &printerIDStr, &name, &state, &ticketJSON,
 		&docSHA, &docFormat, &docSize, &remoteJobID, &errStr, &createdMs, &updatedMs); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -126,6 +167,7 @@ func (s *Store) scanJob(row rowScanner) (*model.Job, error) {
 	}
 	j := &model.Job{
 		ID:          id,
+		Number:      number,
 		PrinterID:   pid,
 		Name:        name,
 		State:       state,

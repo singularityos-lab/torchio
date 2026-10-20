@@ -2,9 +2,8 @@ package discovery
 
 import (
 	"context"
+	"log"
 	"time"
-
-	"github.com/mirkobrombin/go-foundation/pkg/logger"
 
 	"github.com/singularityos-lab/torchio/internal/store"
 )
@@ -15,7 +14,7 @@ import (
 // what is currently on the network.
 type Recorder struct {
 	Store      *store.Store
-	Log        logger.Logger
+	Log        *log.Logger
 	TTL        time.Duration // entries older than this are pruned (default 5m)
 	PruneEvery time.Duration
 }
@@ -51,7 +50,7 @@ func (r Recorder) Run(ctx context.Context, b Browser, now func() time.Time) erro
 			r.record(s, now())
 		case <-prune.C:
 			if err := r.Store.PruneDevices(now().Add(-ttl)); err != nil && r.Log != nil {
-				r.Log.Warn("discovery prune failed: " + err.Error())
+				r.Log.Printf("discovery prune failed: %v", err)
 			}
 		}
 	}
@@ -68,6 +67,6 @@ func (r Recorder) record(s Service, now time.Time) {
 		LastSeen: now,
 	}
 	if err := r.Store.RecordDevice(dev); err != nil && r.Log != nil {
-		r.Log.Warn("discovery record failed: " + err.Error())
+		r.Log.Printf("discovery record failed: %v", err)
 	}
 }

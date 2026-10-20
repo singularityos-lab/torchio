@@ -10,12 +10,14 @@ CREATE TABLE IF NOT EXISTS printers (
     is_default INTEGER NOT NULL DEFAULT 0,
     caps_json  TEXT    NOT NULL DEFAULT '{}',
     attrs_raw  BLOB    NOT NULL DEFAULT x'',
+    queue_json TEXT    NOT NULL DEFAULT '{}',
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS jobs (
     id            TEXT    PRIMARY KEY,
+    number        INTEGER NOT NULL DEFAULT 0,
     printer_id    TEXT    NOT NULL REFERENCES printers(id) ON DELETE CASCADE,
     name          TEXT    NOT NULL DEFAULT '',
     state         TEXT    NOT NULL,

@@ -4,7 +4,7 @@
  "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
 <!--
   PolicyKit actions for Torchio's "polkit" trust backend:
-      TORCHIO_TRUST_BACKEND=polkit torchio daemon
+      TORCHIO_TRUST_BACKEND=polkit torchiod
 
   Install on distributions that run polkit:
       /usr/share/polkit-1/actions/org.torchio.trust.policy

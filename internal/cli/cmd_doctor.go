@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/mirkobrombin/go-foundation/pkg/health"
-
 	"github.com/singularityos-lab/torchio/internal/doctor"
 	"github.com/singularityos-lab/torchio/internal/paths"
 )
@@ -58,7 +56,7 @@ func runDoctor(ctx context.Context, args []string) error {
 	allOK := true
 	for _, n := range names {
 		r := reports[n]
-		if r.Status != health.StatusHealthy {
+		if r.Status != doctor.StatusHealthy {
 			allOK = false
 		}
 		fmt.Printf("%s  %s\n", statusMark(r.Status), n)
@@ -73,11 +71,11 @@ func runDoctor(ctx context.Context, args []string) error {
 }
 
 // statusMark renders a health status as a short ASCII marker.
-func statusMark(s health.Status) string {
+func statusMark(s doctor.Status) string {
 	switch s {
-	case health.StatusHealthy:
+	case doctor.StatusHealthy:
 		return "[ ok ]"
-	case health.StatusDegraded:
+	case doctor.StatusDegraded:
 		return "[warn]"
 	default:
 		return "[FAIL]"

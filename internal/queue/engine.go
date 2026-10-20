@@ -1,20 +1,19 @@
 // Package queue is Torchio's spooler core. It implements the per-printer actor
 // model: one supervising goroutine owns each printer's queue, so jobs for a
 // single printer are serialized (they leave in order) while different printers
-// run in parallel, with no shared locks between queues. State changes go
-// through the go-foundation FSM, are persisted to the store, logged to the
-// append-only event table and emitted on the event bus.
+// run in parallel, with no shared locks between queues. Every state change is
+// checked against the job FSM, persisted, appended to the event log and passed
+// to the optional Notify callback.
 package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"time"
-
-	"github.com/mirkobrombin/go-foundation/pkg/events"
-	"github.com/mirkobrombin/go-foundation/pkg/logger"
 
 	"github.com/singularityos-lab/torchio/internal/detect"
 	"github.com/singularityos-lab/torchio/internal/ipp"
@@ -34,10 +33,10 @@ type Transport interface {
 type Engine struct {
 	store      *store.Store
 	spool      *spool.Spool
-	bus        *events.Bus
+	notify     func(JobEvent)
 	transport  Transport
 	transforms *transform.Registry
-	log        logger.Logger
+	log        *log.Logger
 
 	// baseCtx is the daemon-lifetime context under which actors run. It is set
 	// by Start and is deliberately decoupled from the short-lived per-RPC
@@ -52,22 +51,23 @@ type Engine struct {
 
 // Config wires an Engine's dependencies.
 type Config struct {
-	Store     *store.Store
-	Spool     *spool.Spool
-	Bus       *events.Bus
+	Store *store.Store
+	Spool *spool.Spool
+	// Notify, when set, receives every job event on its own goroutine, so a
+	// slow consumer never stalls job processing.
+	Notify    func(JobEvent)
 	Transport Transport
 	// Transforms is the format-conversion registry. Nil means the built-in
 	// native transforms (DefaultRegistry).
 	Transforms *transform.Registry
-	Logger     logger.Logger
+	Logger     *log.Logger
 }
 
-// New builds an Engine. All fields of cfg except Logger and Transforms are
-// required.
+// New builds an Engine. Store, Spool and Transport are required.
 func New(cfg Config) *Engine {
-	log := cfg.Logger
-	if log == nil {
-		log = logger.New()
+	logger := cfg.Logger
+	if logger == nil {
+		logger = log.Default()
 	}
 	reg := cfg.Transforms
 	if reg == nil {
@@ -76,10 +76,10 @@ func New(cfg Config) *Engine {
 	return &Engine{
 		store:      cfg.Store,
 		spool:      cfg.Spool,
-		bus:        cfg.Bus,
+		notify:     cfg.Notify,
 		transport:  cfg.Transport,
 		transforms: reg,
-		log:        log,
+		log:        logger,
 		actors:     make(map[string]*actor),
 	}
 }
@@ -118,7 +118,6 @@ func (e *Engine) ensureActor(p *model.Printer) *actor {
 	defer e.mu.Unlock()
 	key := p.ID.String()
 	if a, ok := e.actors[key]; ok {
-		a.printer = p // refresh cached printer (URI/caps may have changed)
 		return a
 	}
 	ctx := e.baseCtx
@@ -141,45 +140,118 @@ func (e *Engine) AddPrinter(p *model.Printer) {
 	e.ensureActor(p)
 }
 
-// Submit ingests a document for a printer: it sniffs the real format, stores
-// the bytes in the content-addressed spool, creates the job in state "created",
-// and hands it to the printer's actor. It returns the created job.
+// ErrRejecting is returned by Submit when the queue refuses new jobs.
+var ErrRejecting = errors.New("queue: printer is not accepting jobs")
+
+// PrinterChanged tells the printer's actor to reload its settings and start
+// any job a pause was holding back.
+func (e *Engine) PrinterChanged(p *model.Printer) {
+	e.ensureActor(p).enqueue(command{kind: cmdResume})
+}
+
+// RemovePrinter stops the printer's actor. The store deletes its jobs.
+func (e *Engine) RemovePrinter(id model.ID) {
+	e.mu.Lock()
+	a := e.actors[id.String()]
+	delete(e.actors, id.String())
+	e.mu.Unlock()
+	if a != nil {
+		a.close()
+	}
+}
+
+// Hold keeps a queued job from printing until it is released.
+func (e *Engine) Hold(ctx context.Context, jobID model.ID) error {
+	return e.command(jobID, cmdHold)
+}
+
+// Release lets a held job print.
+func (e *Engine) Release(ctx context.Context, jobID model.ID) error {
+	return e.command(jobID, cmdRelease)
+}
+
+// Restart prints a finished job again.
+func (e *Engine) Restart(ctx context.Context, jobID model.ID) error {
+	return e.command(jobID, cmdRestart)
+}
+
+func (e *Engine) command(jobID model.ID, kind commandKind) error {
+	job, err := e.store.GetJob(jobID)
+	if err != nil {
+		return err
+	}
+	p, err := e.store.GetPrinter(job.PrinterID)
+	if err != nil {
+		return err
+	}
+	e.ensureActor(p).enqueue(command{kind: kind, jobID: jobID})
+	return nil
+}
+
+// Submit ingests a document for a printer and hands the job to the printer's
+// actor. It returns the created job.
 func (e *Engine) Submit(ctx context.Context, printerID model.ID, name string, ticket model.JobTicket, doc io.Reader) (*model.Job, error) {
+	job, err := e.Create(ctx, printerID, name, ticket)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.Attach(ctx, job, doc); err != nil {
+		return nil, err
+	}
+	return job, nil
+}
+
+// Create records a job that has no document yet, so a client that sends the
+// document later already knows the job's number.
+func (e *Engine) Create(ctx context.Context, printerID model.ID, name string, ticket model.JobTicket) (*model.Job, error) {
 	p, err := e.store.GetPrinter(printerID)
 	if err != nil {
 		return nil, fmt.Errorf("queue: unknown printer: %w", err)
 	}
-
-	// Sniff before storing so a malformed file is caught at the cheapest
-	// possible point, and the detector replays the full stream into the spool.
-	format, body, err := detect.Format(doc)
-	if err != nil {
-		return nil, fmt.Errorf("queue: sniff: %w", err)
+	if p.Queue.Rejecting {
+		return nil, ErrRejecting
 	}
-	digest, size, err := e.spool.Put(body)
-	if err != nil {
-		return nil, fmt.Errorf("queue: spool: %w", err)
-	}
-
 	now := time.Now()
 	job := &model.Job{
 		ID:        model.NewID(),
 		PrinterID: printerID,
 		Name:      name,
 		State:     string(model.JobCreated),
-		Ticket:    ticket,
-		Document:  model.DocRef{SHA256: digest, Format: format, Size: size},
+		Ticket:    p.Queue.Ticket(ticket),
 		Created:   now,
 		Updated:   now,
 	}
 	if err := e.store.SaveJob(job); err != nil {
 		return nil, fmt.Errorf("queue: save job: %w", err)
 	}
-	e.appendEvent(ctx, job, model.EventNote, "", "", "user", "submitted")
-
-	a := e.ensureActor(p)
-	a.enqueue(command{kind: cmdSubmit, jobID: job.ID})
+	e.appendEvent(ctx, job, model.EventNote, "", "", "user", "created")
 	return job, nil
+}
+
+// Attach stores the document of a created job and starts processing it. The
+// format is sniffed before storing, so a malformed file is caught at the
+// cheapest point.
+func (e *Engine) Attach(ctx context.Context, job *model.Job, doc io.Reader) error {
+	format, body, err := detect.Format(doc)
+	if err != nil {
+		return fmt.Errorf("queue: sniff: %w", err)
+	}
+	digest, size, err := e.spool.Put(body)
+	if err != nil {
+		return fmt.Errorf("queue: spool: %w", err)
+	}
+	job.Document = model.DocRef{SHA256: digest, Format: format, Size: size}
+	job.Updated = time.Now()
+	if err := e.store.SaveJob(job); err != nil {
+		return fmt.Errorf("queue: save job: %w", err)
+	}
+	e.appendEvent(ctx, job, model.EventNote, "", "", "user", "submitted")
+	p, err := e.store.GetPrinter(job.PrinterID)
+	if err != nil {
+		return err
+	}
+	e.ensureActor(p).enqueue(command{kind: cmdSubmit, jobID: job.ID})
+	return nil
 }
 
 // Cancel requests cancellation of a job. The owning actor performs the
@@ -214,7 +286,7 @@ func (e *Engine) recover(ctx context.Context) error {
 	for _, job := range jobs {
 		if model.JobState(job.State) == model.JobSending {
 			if err := e.transition(ctx, job, model.JobPending, "spooler", "requeued after restart"); err != nil {
-				e.log.Warn("recover requeue failed", logger.Field{Key: "job", Value: job.ID.String()}, logger.Field{Key: "err", Value: err.Error()})
+				e.log.Printf("recover job %s: %v", job.ID, err)
 				continue
 			}
 		}

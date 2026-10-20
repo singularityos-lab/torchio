@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-
-	"github.com/mirkobrombin/go-foundation/pkg/logger"
-	"github.com/mirkobrombin/go-foundation/pkg/resiliency"
+	"sync"
+	"time"
 
 	"github.com/singularityos-lab/torchio/internal/ipp"
 	"github.com/singularityos-lab/torchio/internal/model"
+	"github.com/singularityos-lab/torchio/internal/store"
 	"github.com/singularityos-lab/torchio/internal/transform"
 )
 
@@ -20,7 +20,12 @@ type commandKind int
 
 const (
 	cmdSubmit commandKind = iota // process (or resume) a job
-	cmdCancel                    // cancel a job
+	cmdCancel
+	cmdHold
+	cmdRelease
+	cmdRestart
+	// cmdResume re-reads the printer and restarts its waiting jobs.
+	cmdResume
 )
 
 // command is one message in an actor's inbox.
@@ -36,6 +41,9 @@ type actor struct {
 	engine  *Engine
 	printer *model.Printer
 	inbox   chan command
+
+	mu     sync.Mutex
+	closed bool
 }
 
 // inboxSize bounds how many commands can queue before Submit blocks. Generous,
@@ -50,11 +58,25 @@ func newActor(e *Engine, p *model.Printer) *actor {
 	}
 }
 
-// enqueue posts a command to the actor. It blocks only if the inbox is full.
-func (a *actor) enqueue(c command) { a.inbox <- c }
+// enqueue posts a command to the actor. It blocks only if the inbox is full,
+// and drops the command once the actor is closed.
+func (a *actor) enqueue(c command) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.closed {
+		a.inbox <- c
+	}
+}
 
 // close stops the actor after it drains in-flight commands.
-func (a *actor) close() { close(a.inbox) }
+func (a *actor) close() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.closed {
+		a.closed = true
+		close(a.inbox)
+	}
+}
 
 // run is the actor goroutine. It exits when the inbox is closed or the context
 // is cancelled.
@@ -78,7 +100,69 @@ func (a *actor) handle(ctx context.Context, c command) {
 		a.process(ctx, c.jobID)
 	case cmdCancel:
 		a.cancel(ctx, c.jobID)
+	case cmdHold:
+		a.move(ctx, c.jobID, model.JobHeld, "held by user")
+	case cmdRelease:
+		if a.release(c.jobID) && a.move(ctx, c.jobID, model.JobPending, "released by user") {
+			a.process(ctx, c.jobID)
+		}
+	case cmdRestart:
+		if a.move(ctx, c.jobID, model.JobPending, "restarted by user") {
+			a.process(ctx, c.jobID)
+		}
+	case cmdResume:
+		a.resume(ctx)
 	}
+}
+
+// move applies a user-requested transition and reports whether it happened.
+func (a *actor) move(ctx context.Context, jobID model.ID, to model.JobState, cause string) bool {
+	job, err := a.engine.store.GetJob(jobID)
+	if err != nil {
+		return false
+	}
+	if !model.CanTransition(model.JobState(job.State), to) {
+		return false
+	}
+	return a.step(ctx, job, to, "user", cause) == nil
+}
+
+// release clears the hold request so the job prints once it is pending.
+func (a *actor) release(jobID model.ID) bool {
+	job, err := a.engine.store.GetJob(jobID)
+	if err != nil || model.JobState(job.State) != model.JobHeld {
+		return false
+	}
+	job.Ticket.Hold = false
+	return a.engine.store.SaveJob(job) == nil
+}
+
+// resume picks up the printer's new settings and processes every job that
+// was waiting for it.
+func (a *actor) resume(ctx context.Context) {
+	if !a.refresh() || a.printer.Queue.Paused {
+		return
+	}
+	jobs, err := a.engine.store.ListJobs(store.JobFilter{PrinterID: a.printer.ID, Active: true})
+	if err != nil {
+		a.engine.log.Printf("resume %s: %v", a.printer.Name, err)
+		return
+	}
+	for _, j := range jobs {
+		if model.JobState(j.State) != model.JobHeld {
+			a.process(ctx, j.ID)
+		}
+	}
+}
+
+// refresh reloads the printer so the actor sees settings changed elsewhere.
+func (a *actor) refresh() bool {
+	p, err := a.engine.store.GetPrinter(a.printer.ID)
+	if err != nil {
+		return false
+	}
+	a.printer = p
+	return true
 }
 
 // cancel transitions a non-terminal job to canceled. A job being streamed is
@@ -92,7 +176,7 @@ func (a *actor) cancel(ctx context.Context, jobID model.ID) {
 		return
 	}
 	if err := a.engine.transition(ctx, job, model.JobCanceled, "user", "cancelled by user"); err != nil {
-		a.engine.log.Warn("cancel failed: " + err.Error())
+		a.engine.log.Printf("cancel failed: %v", err)
 	}
 }
 
@@ -102,7 +186,13 @@ func (a *actor) cancel(ctx context.Context, jobID model.ID) {
 func (a *actor) process(ctx context.Context, jobID model.ID) {
 	job, err := a.engine.store.GetJob(jobID)
 	if err != nil {
-		a.engine.log.Warn("process: load job: " + err.Error())
+		a.engine.log.Printf("process: load job: %v", err)
+		return
+	}
+	if !a.refresh() {
+		return
+	}
+	if model.JobState(job.State) == model.JobCreated && job.Document.SHA256 == "" {
 		return
 	}
 
@@ -123,17 +213,27 @@ func (a *actor) process(ctx context.Context, jobID model.ID) {
 				return // aborted inside validate
 			}
 		case model.JobPending:
+			if job.Ticket.Hold {
+				_ = a.step(ctx, job, model.JobHeld, "user", "held until released")
+				return
+			}
+			if a.printer.Queue.Paused {
+				return
+			}
 			if !a.prepare(ctx, job) {
 				return // aborted inside prepare
 			}
 		case model.JobSpooled:
+			if a.printer.Queue.Paused {
+				return
+			}
 			if !a.send(ctx, job) {
 				return // aborted inside send
 			}
 		case model.JobHeld:
 			return
 		default:
-			a.engine.log.Warn("process: unexpected state " + job.State)
+			a.engine.log.Printf("process: unexpected state %s", job.State)
 			return
 		}
 	}
@@ -240,9 +340,7 @@ func (a *actor) send(ctx context.Context, job *model.Job) bool {
 	}
 
 	var result *ipp.PrintResult
-	attempt := 0
-	err := resiliency.Retry(ctx, func() error {
-		attempt++
+	err := retry(ctx, sendAttempts, func() error {
 		rc, openErr := a.engine.spool.Open(job.Document.SHA256)
 		if openErr != nil {
 			return permanent{openErr} // a missing blob will not fix itself
@@ -267,7 +365,7 @@ func (a *actor) send(ctx context.Context, job *model.Job) bool {
 		}
 		result = r
 		return nil
-	}, resiliency.WithAttempts(3), resiliency.WithRetryIf(isRetryable))
+	})
 
 	if err != nil {
 		_ = a.step(ctx, job, model.JobAborted, "printer", "send failed: "+err.Error())
@@ -277,10 +375,7 @@ func (a *actor) send(ctx context.Context, job *model.Job) bool {
 	if result != nil {
 		job.RemoteJobID = result.JobID
 	}
-	a.engine.log.Info("job sent",
-		logger.Field{Key: "job", Value: job.ID.String()},
-		logger.Field{Key: "printer", Value: a.printer.Name},
-		logger.Field{Key: "remote-job", Value: job.RemoteJobID})
+	a.engine.log.Printf("job %s sent to %s as job %d", job.ID, a.printer.Name, job.RemoteJobID)
 	return a.step(ctx, job, model.JobCompleted, "printer", "accepted by printer") == nil
 }
 
@@ -288,7 +383,7 @@ func (a *actor) send(ctx context.Context, job *model.Job) bool {
 // callers can stop the processing loop.
 func (a *actor) step(ctx context.Context, job *model.Job, to model.JobState, actor, cause string) error {
 	if err := a.engine.transition(ctx, job, to, actor, cause); err != nil {
-		a.engine.log.Warn("transition failed: " + err.Error())
+		a.engine.log.Printf("transition failed: %v", err)
 		return err
 	}
 	return nil
@@ -300,8 +395,27 @@ type permanent struct{ err error }
 func (p permanent) Error() string { return p.err.Error() }
 func (p permanent) Unwrap() error { return p.err }
 
-// isRetryable tells the retry helper to skip permanent errors.
-func isRetryable(err error) bool {
-	var p permanent
-	return !errors.As(err, &p)
+const sendAttempts = 3
+
+// retry runs fn up to attempts times, backing off between tries, and stops at
+// the first success, permanent error or cancellation.
+func retry(ctx context.Context, attempts int, fn func() error) error {
+	var err error
+	delay := 500 * time.Millisecond
+	for i := 0; i < attempts; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+		var p permanent
+		if errors.As(err, &p) || i == attempts-1 {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+		delay *= 2
+	}
+	return err
 }

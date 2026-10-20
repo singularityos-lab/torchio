@@ -1,23 +1,21 @@
-// Package daemon assembles torchiod, the per-user spooler. It is built on
-// go-foundation's hosting host: the store, spool, event bus and queue engine
-// are wired once, the engine and the control server run as background services,
-// and a clean shutdown drains them. There is no privilege here; the daemon runs
-// in the user session and its only API is the control socket.
+// Package daemon assembles torchiod, the per-user spooler. It holds no
+// privilege: it runs in the user session and serves the control socket, the
+// CUPS-compatible socket and the XDG print portal backend.
 package daemon
 
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 
-	"github.com/mirkobrombin/go-foundation/pkg/events"
-	"github.com/mirkobrombin/go-foundation/pkg/logger"
-
+	"github.com/singularityos-lab/torchio/internal/admin"
 	"github.com/singularityos-lab/torchio/internal/control"
 	"github.com/singularityos-lab/torchio/internal/cupscompat"
 	"github.com/singularityos-lab/torchio/internal/discovery"
@@ -37,9 +35,11 @@ type Daemon struct {
 	spool    *spool.Spool
 	engine   *queue.Engine
 	server   *control.Server
+	admin    *admin.Admin
+	trust    portal.Portal
 	recorder discovery.Recorder
 	pdfium   *transform.PDFiumTransform
-	log      logger.Logger
+	log      *log.Logger
 
 	printConn *dbus.Conn   // session bus for the XDG print portal, if available
 	cupsSrv   *http.Server // CUPS-compat front end, if bound
@@ -67,12 +67,10 @@ func Open() (*Daemon, error) {
 		return nil, err
 	}
 
-	log := logger.New()
-	bus := events.New()
+	logger := log.Default()
 
-	// Transform registry: the native (pure-Go) transforms plus pdfium for
-	// PDF -> PWG raster. pdfium initializes lazily on first use, so a daemon
-	// that only prints PDFs to PDF-capable printers never pays its cost.
+	// pdfium initializes lazily, so a daemon that only prints PDFs to
+	// PDF-capable printers never pays its start-up cost.
 	reg := transform.DefaultRegistry()
 	pdfiumTr := transform.NewPDFiumTransform(300)
 	reg.Register(pdfiumTr)
@@ -80,16 +78,12 @@ func Open() (*Daemon, error) {
 	eng := queue.New(queue.Config{
 		Store:      st,
 		Spool:      sp,
-		Bus:        bus,
 		Transport:  ipp.NewClient(),
 		Transforms: reg,
-		Logger:     log,
+		Logger:     logger,
 	})
 
-	// Trust decisions go to the ush portal over the session bus. With no
-	// session bus (e.g. a headless run) we fall back to deny-by-default: a
-	// printer is never added without a human, which is the safe choice.
-	trust := selectPortal(log)
+	trust := selectPortal(logger)
 
 	svc := control.NewService(st, eng, trust)
 	srv, err := control.NewServer(svc)
@@ -98,16 +92,14 @@ func Open() (*Daemon, error) {
 		return nil, err
 	}
 
-	rec := discovery.Recorder{Store: st, Log: log}
-	return &Daemon{store: st, spool: sp, engine: eng, server: srv, recorder: rec, pdfium: pdfiumTr, log: log}, nil
+	rec := discovery.Recorder{Store: st, Log: logger}
+	return &Daemon{store: st, spool: sp, engine: eng, server: srv, recorder: rec, admin: admin.New(st, eng), trust: trust, pdfium: pdfiumTr, log: logger}, nil
 }
 
-// selectPortal chooses the trust backend. The default is the ush broker, the
-// default; $TORCHIO_TRUST_BACKEND lets
-// other distributions pick polkit, a declarative policy file, or deny-by-default
-// without the core knowing which is in use. Any failure falls back to deny, so
-// a printer is never added, a cert never trusted, without a working backend.
-func selectPortal(log logger.Logger) portal.Portal {
+// selectPortal chooses the trust backend from $TORCHIO_TRUST_BACKEND, ush by
+// default. Any failure falls back to deny, so a printer is never added and a
+// certificate never trusted without a working backend.
+func selectPortal(log *log.Logger) portal.Portal {
 	backend := os.Getenv("TORCHIO_TRUST_BACKEND")
 	if backend == "" {
 		backend = portal.BackendUSH
@@ -120,11 +112,11 @@ func selectPortal(log logger.Logger) portal.Portal {
 	}
 	p, err := portal.Select(backend, "", policyFile)
 	if err != nil {
-		log.Warn("trust backend " + backend + " unavailable; denying by default: " + err.Error())
+		log.Printf("trust backend %s unavailable, denying by default: %v", backend, err)
 		return portal.AlwaysDeny{}
 	}
 	if backend == portal.BackendAllow {
-		log.Warn("trust backend is 'allow': every permission is auto-granted (development only)")
+		log.Print("trust backend is 'allow': every permission is granted (development only)")
 	}
 	return p
 }
@@ -134,23 +126,27 @@ func selectPortal(log logger.Logger) portal.Portal {
 func (d *Daemon) startPrintPortal(ctx context.Context) {
 	conn, err := dbus.SessionBus()
 	if err != nil {
-		d.log.Warn("XDG print portal disabled (no session bus): " + err.Error())
+		d.log.Printf("XDG print portal disabled, no session bus: %v", err)
 		return
 	}
 	backend := printportal.New(spoolerJobs{store: d.store, engine: d.engine})
 	if err := printportal.Serve(ctx, conn, backend); err != nil {
-		d.log.Warn("XDG print portal disabled: " + err.Error())
+		d.log.Printf("XDG print portal disabled: %v", err)
 		_ = conn.Close()
 		return
 	}
 	d.printConn = conn
-	d.log.Info("XDG print portal active", logger.Field{Key: "bus", Value: "org.freedesktop.impl.portal.desktop.torchio"})
+	d.log.Print("XDG print portal active")
 }
 
-// cupsSocketPath returns where to expose the CUPS-compatible front end:
-// $TORCHIO_CUPS_SOCKET if set, else the well-known CUPS socket.
+// cupsSocketPath returns where to expose the CUPS-compatible front end. A
+// session that points libcups at a socket path through CUPS_SERVER gets
+// torchiod on that same path.
 func cupsSocketPath() string {
 	if p := os.Getenv("TORCHIO_CUPS_SOCKET"); p != "" {
+		return p
+	}
+	if p := os.Getenv("CUPS_SERVER"); filepath.IsAbs(p) {
 		return p
 	}
 	return "/run/cups/cups.sock"
@@ -162,20 +158,22 @@ func cupsSocketPath() string {
 // still work.
 func (d *Daemon) startCupsCompat(ctx context.Context) {
 	sock := cupsSocketPath()
+	_ = os.MkdirAll(filepath.Dir(sock), 0o700)
 	// A leftover socket from a dead owner would block bind; clear only ours.
 	if fi, err := os.Stat(sock); err == nil && fi.Mode()&os.ModeSocket != 0 {
 		_ = os.Remove(sock)
 	}
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
-		d.log.Warn("CUPS-compat disabled (cannot bind " + sock + "): " + err.Error())
+		d.log.Printf("CUPS socket disabled, cannot bind %s: %v", sock, err)
 		return
 	}
 	_ = os.Chmod(sock, 0o666) // apps run as the user; the socket dir gates access
 
-	compat := cupscompat.New(cupsBackend{store: d.store, engine: d.engine})
-	// Per-operation tracing, quiet by default (raise the log level to see it).
-	compat.Logf = func(f string, a ...any) { d.log.Debug("cupscompat " + fmt.Sprintf(f, a...)) }
+	compat := cupscompat.New(cupsBackend{store: d.store, engine: d.engine, admin: d.admin, trust: d.trust})
+	if os.Getenv("TORCHIO_DEBUG") != "" {
+		compat.Logf = func(f string, a ...any) { d.log.Printf("cups: "+f, a...) }
+	}
 	srv := &http.Server{Handler: compat}
 	d.cupsSrv = srv
 	d.cupsLn = ln
@@ -185,10 +183,10 @@ func (d *Daemon) startCupsCompat(ctx context.Context) {
 	}()
 	go func() {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			d.log.Warn("CUPS-compat server: " + err.Error())
+			d.log.Printf("CUPS socket: %v", err)
 		}
 	}()
-	d.log.Info("CUPS-compat active", logger.Field{Key: "socket", Value: sock})
+	d.log.Printf("CUPS socket on %s", sock)
 }
 
 // Run starts the engine and the control server and blocks until ctx is
@@ -205,26 +203,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.server.Listen(socket); err != nil {
 		return err
 	}
-	d.log.Info("torchiod listening", logger.Field{Key: "socket", Value: socket})
+	d.log.Printf("listening on %s", socket)
 
-	// Start read-only network discovery. A failure to open the multicast
-	// socket (restricted environments, no network) is non-fatal: the daemon
-	// runs fine without discovery, and printers can still be added by URI.
+	// Without multicast (no network, restricted sandbox) printers can still
+	// be added by URI, so discovery failing is not fatal.
 	go func() {
 		if err := d.recorder.Run(ctx, discovery.MDNS{}, time.Now); err != nil {
-			d.log.Warn("discovery disabled: " + err.Error())
+			d.log.Printf("discovery disabled: %v", err)
 		}
 	}()
 
-	// Start the XDG print portal backend so sandboxed GTK apps print through
-	// Torchio. Non-fatal: with no session bus, apps simply do not get this
-	// integration, and CLI printing still works.
 	d.startPrintPortal(ctx)
-
-	// Start the CUPS-compatible front end so existing libcups apps (GTK/Qt
-	// dialogs, lp/lpstat, Chromium) see Torchio's queues as CUPS queues.
-	// Non-fatal: binding the CUPS socket needs cupsd not to own it and the
-	// socket dir to be writable.
 	d.startCupsCompat(ctx)
 
 	serveErr := make(chan error, 1)
@@ -244,7 +233,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 // shutdown stops the components in reverse order of start.
 func (d *Daemon) shutdown() {
-	d.log.Info("torchiod shutting down")
+	d.log.Print("shutting down")
 	if d.printConn != nil {
 		_ = d.printConn.Close()
 	}

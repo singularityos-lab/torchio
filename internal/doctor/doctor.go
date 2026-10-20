@@ -1,32 +1,63 @@
 // Package doctor is the end-to-end diagnostic CUPS never had: one command that
 // checks the whole print path (daemon reachable, printer reachable, TLS
-// handshake, Get-Printer-Attributes) and says exactly what is wrong. It is
-// built on go-foundation's health.Registry so each check is a composable
-// Checker with a structured Report.
+// handshake, Get-Printer-Attributes) and says exactly what is wrong.
 package doctor
 
 import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"time"
-
-	"github.com/mirkobrombin/go-foundation/pkg/health"
 
 	"github.com/singularityos-lab/torchio/internal/ipp"
 )
 
+// Status is the outcome of one check.
+type Status int
+
+const (
+	StatusHealthy Status = iota
+	// StatusDegraded means reachable but not ready, such as a stopped printer.
+	StatusDegraded
+	StatusUnhealthy
+)
+
+// Report is the result of one check.
+type Report struct {
+	Status   Status
+	Duration time.Duration
+	Details  map[string]any
+}
+
+type checker interface {
+	Check(ctx context.Context) Report
+}
+
 // Diagnose runs all checks and returns their reports keyed by check name. The
 // socket is the daemon control socket; uris are printer URIs to probe (the CLI
 // gathers these from the daemon's printer list plus any explicit argument).
-func Diagnose(ctx context.Context, socket string, uris []string) map[string]health.Report {
-	reg := health.NewRegistry()
-	reg.Register("daemon", daemonChecker{socket: socket})
+func Diagnose(ctx context.Context, socket string, uris []string) map[string]Report {
+	checks := map[string]checker{"daemon": daemonChecker{socket: socket}}
 	client := ipp.NewClient()
 	for _, u := range uris {
-		reg.Register("printer:"+u, ippChecker{client: client, uri: u})
+		checks["printer:"+u] = ippChecker{client: client, uri: u}
 	}
-	return reg.CheckAll(ctx)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	out := make(map[string]Report, len(checks))
+	for name, c := range checks {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := c.Check(ctx)
+			mu.Lock()
+			out[name] = r
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	return out
 }
 
 // daemonChecker verifies the control socket accepts a connection.
@@ -34,19 +65,19 @@ type daemonChecker struct {
 	socket string
 }
 
-func (c daemonChecker) Check(ctx context.Context) health.Report {
+func (c daemonChecker) Check(ctx context.Context) Report {
 	start := time.Now()
 	conn, err := net.DialTimeout("unix", c.socket, 3*time.Second)
 	if err != nil {
-		return health.Report{
-			Status:   health.StatusUnhealthy,
+		return Report{
+			Status:   StatusUnhealthy,
 			Duration: time.Since(start),
-			Details:  map[string]any{"socket": c.socket, "error": err.Error(), "hint": "is `torchio daemon` running?"},
+			Details:  map[string]any{"socket": c.socket, "error": err.Error(), "hint": "is torchiod running?"},
 		}
 	}
 	_ = conn.Close()
-	return health.Report{
-		Status:   health.StatusHealthy,
+	return Report{
+		Status:   StatusHealthy,
 		Duration: time.Since(start),
 		Details:  map[string]any{"socket": c.socket},
 	}
@@ -59,23 +90,23 @@ type ippChecker struct {
 	uri    string
 }
 
-func (c ippChecker) Check(ctx context.Context) health.Report {
+func (c ippChecker) Check(ctx context.Context) Report {
 	start := time.Now()
 	msg, err := c.client.GetPrinterAttributes(ctx, c.uri)
 	if err != nil {
-		return health.Report{
-			Status:   health.StatusUnhealthy,
+		return Report{
+			Status:   StatusUnhealthy,
 			Duration: time.Since(start),
 			Details:  map[string]any{"uri": c.uri, "error": err.Error()},
 		}
 	}
 	caps := ipp.ParseCapabilities(msg)
-	status := health.StatusHealthy
+	status := StatusHealthy
 	// A stopped printer is reachable but not ready: report it as degraded.
 	if caps.State == 5 {
-		status = health.StatusDegraded
+		status = StatusDegraded
 	}
-	return health.Report{
+	return Report{
 		Status:   status,
 		Duration: time.Since(start),
 		Details: map[string]any{

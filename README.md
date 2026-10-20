@@ -6,13 +6,16 @@ against it unchanged. The spooler runs per user, format conversions (pdfium incl
 run as WebAssembly modules, and printers found on the network are added only after the
 user confirms.
 
+`torchiod` is the per-user daemon, `torchio` the client. Packaging notes are in
+`packaging/`.
+
 ## Build
 
-    go build ./cmd/torchio
+    make
 
-Static binary for the image:
+Static binaries for the image:
 
-    CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o torchio ./cmd/torchio
+    make static
 
 ## Use of Generative AI
 

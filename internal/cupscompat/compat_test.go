@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/OpenPrinting/goipp"
 
@@ -21,7 +22,8 @@ type fakeBackend struct {
 
 	mu        sync.Mutex
 	submitted []submission
-	nextID    int
+	jobs      []Job
+	actions   []string
 }
 
 type submission struct {
@@ -32,12 +34,7 @@ type submission struct {
 
 func (f *fakeBackend) ListPrinters() []model.Printer { return f.printers }
 func (f *fakeBackend) DefaultPrinter() (model.Printer, bool) {
-	for _, p := range f.printers {
-		if p.Name == f.def {
-			return p, true
-		}
-	}
-	return model.Printer{}, false
+	return f.PrinterByName(f.def)
 }
 func (f *fakeBackend) PrinterByName(name string) (model.Printer, bool) {
 	for _, p := range f.printers {
@@ -47,16 +44,125 @@ func (f *fakeBackend) PrinterByName(name string) (model.Printer, bool) {
 	}
 	return model.Printer{}, false
 }
-func (f *fakeBackend) Submit(_ context.Context, printer, name string, _ model.JobTicket, doc io.Reader) (string, error) {
+func (f *fakeBackend) Submit(_ context.Context, printer, name string, _ model.JobTicket, doc io.Reader) (Job, error) {
 	data, _ := io.ReadAll(doc)
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.nextID++
 	f.submitted = append(f.submitted, submission{printer: printer, name: name, doc: data})
-	return "spool-job", nil
+	j := Job{Number: len(f.jobs) + 1, Printer: printer, Name: name, State: model.JobSending, Created: time.Now(), Updated: time.Now()}
+	f.jobs = append(f.jobs, j)
+	return j, nil
 }
-func (f *fakeBackend) JobState(string) (model.JobState, bool) { return model.JobSending, true }
-func (f *fakeBackend) Cancel(context.Context, string) error   { return nil }
+func (f *fakeBackend) Create(_ context.Context, printer, name string, _ model.JobTicket) (Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	j := Job{Number: len(f.jobs) + 1, Printer: printer, Name: name, State: model.JobCreated, Created: time.Now(), Updated: time.Now()}
+	f.jobs = append(f.jobs, j)
+	return j, nil
+}
+func (f *fakeBackend) Attach(_ context.Context, n int, doc io.Reader) (Job, error) {
+	data, _ := io.ReadAll(doc)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.jobs {
+		if f.jobs[i].Number == n {
+			f.jobs[i].State = model.JobSending
+			f.submitted = append(f.submitted, submission{printer: f.jobs[i].Printer, name: f.jobs[i].Name, doc: data})
+			return f.jobs[i], nil
+		}
+	}
+	return Job{}, ErrNotFound
+}
+func (f *fakeBackend) Job(n int) (Job, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, j := range f.jobs {
+		if j.Number == n {
+			return j, true
+		}
+	}
+	return Job{}, false
+}
+func (f *fakeBackend) Jobs(printer, which string) []Job {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []Job
+	for _, j := range f.jobs {
+		if printer != "" && j.Printer != printer {
+			continue
+		}
+		done := j.State.IsTerminal()
+		if (which == WhichActive && done) || (which == WhichFinished && !done) {
+			continue
+		}
+		out = append(out, j)
+	}
+	return out
+}
+func (f *fakeBackend) JobAction(_ context.Context, n int, action string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.jobs {
+		if f.jobs[i].Number != n {
+			continue
+		}
+		f.actions = append(f.actions, action)
+		switch action {
+		case ActionHold:
+			f.jobs[i].State = model.JobHeld
+		case ActionRelease:
+			f.jobs[i].State = model.JobPending
+		case ActionCancel:
+			f.jobs[i].State = model.JobCanceled
+		}
+		return nil
+	}
+	return ErrNotFound
+}
+func (f *fakeBackend) AddOrModifyPrinter(_ context.Context, name string, c PrinterChange) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := range f.printers {
+		if f.printers[i].Name != name {
+			continue
+		}
+		q := &f.printers[i].Queue
+		if c.Info != nil {
+			q.Info = *c.Info
+		}
+		if c.Paused != nil {
+			q.Paused = *c.Paused
+		}
+		if c.Accepting != nil {
+			q.Rejecting = !*c.Accepting
+		}
+		return nil
+	}
+	if c.URI == nil {
+		return ErrNotPossible
+	}
+	f.printers = append(f.printers, model.Printer{Name: name, URI: *c.URI})
+	return nil
+}
+func (f *fakeBackend) DeletePrinter(name string) error {
+	for i, p := range f.printers {
+		if p.Name == name {
+			f.printers = append(f.printers[:i], f.printers[i+1:]...)
+			return nil
+		}
+	}
+	return ErrNotFound
+}
+func (f *fakeBackend) SetDefault(name string) error {
+	if _, ok := f.PrinterByName(name); !ok {
+		return ErrNotFound
+	}
+	f.def = name
+	return nil
+}
+func (f *fakeBackend) Devices(context.Context) []Device {
+	return []Device{{URI: "ipps://new.local/ipp/print", Info: "New Printer", MakeModel: "New Printer", Class: "network"}}
+}
 
 func (f *fakeBackend) lastSubmission() (submission, bool) {
 	f.mu.Lock()
@@ -235,5 +341,122 @@ func TestCreateJobSendDocument(t *testing.T) {
 	respG := do(t, url, ga, nil)
 	if st, ok := intAttr(respG.Job, "job-state"); !ok || st != ippJobProcessing {
 		t.Errorf("job-state = %d/%v, want processing(5)", st, ok)
+	}
+}
+
+func onPrinter(op goipp.Op, id uint32, name string) *goipp.Message {
+	m := req(op, id)
+	m.Operation.Add(goipp.MakeAttribute("printer-uri", goipp.TagURI, goipp.String("ipp://localhost/printers/"+name)))
+	return m
+}
+
+func printJob(t *testing.T, url, printer string) int {
+	t.Helper()
+	resp := do(t, url, onPrinter(goipp.OpPrintJob, 2, printer), []byte("%PDF-1.7\n%%EOF\n"))
+	id, ok := intAttr(resp.Job, "job-id")
+	if !ok {
+		t.Fatal("Print-Job returned no job-id")
+	}
+	return id
+}
+
+func TestHoldReleaseAndGetJobs(t *testing.T) {
+	b := sampleBackend()
+	url := serve(t, b)
+	id := printJob(t, url, "office")
+
+	h := req(goipp.OpHoldJob, 3)
+	h.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(id)))
+	if r := do(t, url, h, nil); goipp.Status(r.Code) != goipp.StatusOk {
+		t.Fatalf("Hold-Job status %s", goipp.Status(r.Code))
+	}
+	ga := req(goipp.OpGetJobAttributes, 4)
+	ga.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(id)))
+	if st, _ := intAttr(do(t, url, ga, nil).Job, "job-state"); st != ippJobHeld {
+		t.Errorf("job-state after hold = %d, want %d", st, ippJobHeld)
+	}
+
+	r := req(goipp.OpReleaseJob, 5)
+	r.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(id)))
+	do(t, url, r, nil)
+
+	c := req(goipp.OpCancelJob, 6)
+	c.Operation.Add(goipp.MakeAttribute("job-id", goipp.TagInteger, goipp.Integer(id)))
+	do(t, url, c, nil)
+
+	gj := onPrinter(goipp.OpGetJobs, 7, "office")
+	gj.Operation.Add(goipp.MakeAttribute("which-jobs", goipp.TagKeyword, goipp.String("completed")))
+	jobs := 0
+	for _, g := range do(t, url, gj, nil).Groups {
+		if g.Tag == goipp.TagJobGroup {
+			jobs++
+		}
+	}
+	if jobs != 1 {
+		t.Errorf("completed jobs = %d, want 1", jobs)
+	}
+	if got := len(b.actions); got != 3 {
+		t.Errorf("actions = %v", b.actions)
+	}
+}
+
+func TestPauseShowsStoppedPrinter(t *testing.T) {
+	b := sampleBackend()
+	url := serve(t, b)
+	if r := do(t, url, onPrinter(goipp.OpPausePrinter, 2, "office"), nil); goipp.Status(r.Code) != goipp.StatusOk {
+		t.Fatalf("Pause-Printer status %s", goipp.Status(r.Code))
+	}
+	attrs := do(t, url, onPrinter(goipp.OpGetPrinterAttributes, 3, "office"), nil).Printer
+	if st, _ := intAttr(attrs, "printer-state"); st != 5 {
+		t.Errorf("printer-state = %d, want 5", st)
+	}
+	if reason, _ := strAttr(attrs, "printer-state-reasons"); reason != "paused" {
+		t.Errorf("printer-state-reasons = %q", reason)
+	}
+}
+
+func TestAddModifyDeleteAndDefault(t *testing.T) {
+	b := sampleBackend()
+	url := serve(t, b)
+
+	m := onPrinter(goipp.OpCupsAddModifyPrinter, 2, "office")
+	m.Printer.Add(goipp.MakeAttribute("printer-info", goipp.TagText, goipp.String("Second floor")))
+	do(t, url, m, nil)
+	attrs := do(t, url, onPrinter(goipp.OpGetPrinterAttributes, 3, "office"), nil).Printer
+	if info, _ := strAttr(attrs, "printer-info"); info != "Second floor" {
+		t.Errorf("printer-info = %q", info)
+	}
+
+	add := onPrinter(goipp.OpCupsAddModifyPrinter, 4, "new")
+	add.Printer.Add(goipp.MakeAttribute("device-uri", goipp.TagURI, goipp.String("ipps://new.local/ipp/print")))
+	do(t, url, add, nil)
+	if _, ok := b.PrinterByName("new"); !ok {
+		t.Fatal("CUPS-Add-Modify-Printer did not add the queue")
+	}
+
+	do(t, url, onPrinter(goipp.OpCupsSetDefault, 5, "new"), nil)
+	if n, _ := strAttr(do(t, url, req(goipp.OpCupsGetDefault, 6), nil).Printer, "printer-name"); n != "new" {
+		t.Errorf("default = %q, want new", n)
+	}
+
+	do(t, url, onPrinter(goipp.OpCupsDeletePrinter, 7, "new"), nil)
+	if _, ok := b.PrinterByName("new"); ok {
+		t.Error("CUPS-Delete-Printer left the queue")
+	}
+	if r := do(t, url, onPrinter(goipp.OpCupsDeletePrinter, 8, "missing"), nil); goipp.Status(r.Code) != goipp.StatusErrorNotFound {
+		t.Errorf("delete missing = %s", goipp.Status(r.Code))
+	}
+}
+
+func TestGetDevices(t *testing.T) {
+	url := serve(t, sampleBackend())
+	var uris []string
+	for _, g := range do(t, url, req(goipp.OpCupsGetDevices, 2), nil).Groups {
+		if u, ok := strAttr(g.Attrs, "device-uri"); ok && g.Tag == goipp.TagPrinterGroup {
+			uris = append(uris, u)
+		}
+	}
+	if len(uris) != 1 || uris[0] != "ipps://new.local/ipp/print" {
+		t.Errorf("devices = %v", uris)
 	}
 }

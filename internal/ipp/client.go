@@ -1,9 +1,8 @@
 // Package ipp is Torchio's IPP client. Every print destination is an IPP
-// endpoint, so this package is the one place that
-// actually speaks the wire protocol: it builds goipp messages, posts them over
-// HTTP(S), decodes the reply and turns the IPP status into a Go error. Higher
-// layers (the CLI and the spooler) only ever see typed requests
-// and results.
+// endpoint, so this package is the one place that speaks the wire protocol: it
+// builds goipp messages, posts them over HTTP(S), decodes the reply and turns
+// the IPP status into a Go error. The CLI and the spooler only see typed
+// requests and results.
 package ipp
 
 import (

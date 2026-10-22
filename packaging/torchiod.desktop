@@ -3,4 +3,5 @@ Type=Application
 Name=Print Spooler
 Exec=/usr/bin/torchiod
 NoDisplay=true
+OnlyShowIn=Singularity;
 X-GNOME-Autostart-enabled=true

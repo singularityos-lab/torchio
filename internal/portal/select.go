@@ -4,7 +4,7 @@ import "fmt"
 
 // Trust backend names accepted by Select.
 const (
-	// BackendUSH delegates to the ush broker over D-Bus. This is the default.
+	// BackendUSH delegates to the ush broker over its control socket. This is the default.
 	BackendUSH = "ush"
 	// BackendPolkit delegates to PolicyKit. It exists so distributions outside
 	// the Singularity ecosystem can adopt Torchio against the authorization
@@ -28,7 +28,7 @@ const (
 func Select(backend, sessionID, policyFile string) (Portal, error) {
 	switch backend {
 	case "", BackendUSH:
-		return NewDBus(sessionID)
+		return NewBroker(sessionID)
 	case BackendPolkit:
 		return NewPolkit()
 	case BackendPolicy:

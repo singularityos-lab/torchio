@@ -1,8 +1,11 @@
 package discovery
 
 import (
+	"fmt"
 	"net"
+	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -16,13 +19,22 @@ type assembler struct {
 	want        map[string]bool     // service types of interest
 	byInstance  map[string]*Service // keyed by the instance FQDN
 	addrsByHost map[string][]net.IP // host FQDN -> addresses
+	sent        map[string]emission
 }
+
+type emission struct {
+	signature string
+	at        time.Time
+}
+
+const refreshEvery = time.Minute
 
 func newAssembler(types ...string) *assembler {
 	a := &assembler{
 		want:        make(map[string]bool, len(types)),
 		byInstance:  make(map[string]*Service),
 		addrsByHost: make(map[string][]net.IP),
+		sent:        make(map[string]emission),
 	}
 	for _, t := range types {
 		a.want[t] = true
@@ -119,6 +131,11 @@ func (a *assembler) onTXT(instanceFQDN string, txt []string) {
 
 // onAddr records an address for a host.
 func (a *assembler) onAddr(hostFQDN string, ip net.IP) {
+	for _, known := range a.addrsByHost[hostFQDN] {
+		if known.Equal(ip) {
+			return
+		}
+	}
 	dup := make(net.IP, len(ip))
 	copy(dup, ip)
 	a.addrsByHost[hostFQDN] = append(a.addrsByHost[hostFQDN], dup)
@@ -189,3 +206,31 @@ func unescapeLabel(s string) string {
 }
 
 func isDigit(c byte) bool { return c >= '0' && c <= '9' }
+
+func (a *assembler) changed(services []Service, now time.Time) []Service {
+	var out []Service
+	for _, s := range services {
+		sig := signature(s)
+		last, ok := a.sent[s.Key()]
+		if ok && last.signature == sig && now.Sub(last.at) < refreshEvery {
+			continue
+		}
+		a.sent[s.Key()] = emission{signature: sig, at: now}
+		out = append(out, s)
+	}
+	return out
+}
+
+func signature(s Service) string {
+	keys := make([]string, 0, len(s.TXT))
+	for k := range s.TXT {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s|%d|%v", s.Host, s.Port, s.Addrs)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "|%s=%s", k, s.TXT[k])
+	}
+	return b.String()
+}

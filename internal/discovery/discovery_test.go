@@ -150,3 +150,25 @@ func TestRecorderWritesToDevicesSeen(t *testing.T) {
 		t.Errorf("discovery created %d printers; it must create none", len(printers))
 	}
 }
+
+func TestRepeatedResponsesAreNotReemitted(t *testing.T) {
+	asm := newAssembler(ServiceIPP, ServiceIPPS)
+	now := time.Unix(1790000000, 0)
+	first := asm.changed(asm.ingest(buildResponse(t)), now)
+	if len(first) != 1 {
+		t.Fatalf("first ingest emitted %d services", len(first))
+	}
+	for i := 0; i < 1000; i++ {
+		if again := asm.changed(asm.ingest(buildResponse(t)), now.Add(time.Second)); len(again) != 0 {
+			t.Fatalf("repeat %d re-emitted %d services", i, len(again))
+		}
+	}
+	for host, addrs := range asm.addrsByHost {
+		if len(addrs) != 1 {
+			t.Fatalf("%s kept %d addresses", host, len(addrs))
+		}
+	}
+	if later := asm.changed(asm.ingest(buildResponse(t)), now.Add(2*time.Minute)); len(later) != 1 {
+		t.Fatalf("refresh emitted %d services", len(later))
+	}
+}

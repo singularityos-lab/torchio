@@ -69,7 +69,7 @@ func (m MDNS) Browse(ctx context.Context) (<-chan Service, error) {
 				}
 				continue
 			}
-			for _, s := range asm.ingest(buf[:n]) {
+			for _, s := range asm.changed(asm.ingest(buf[:n]), time.Now()) {
 				select {
 				case out <- s:
 				case <-ctx.Done():

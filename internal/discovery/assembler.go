@@ -68,31 +68,40 @@ func (a *assembler) readSection(p *dnsmessage.Parser, header func() (dnsmessage.
 		if err != nil {
 			return // ErrSectionDone or a parse error: stop this section
 		}
+		var bodyErr error
 		switch h.Type {
 		case dnsmessage.TypePTR:
-			if r, err := p.PTRResource(); err == nil {
+			var r dnsmessage.PTRResource
+			if r, bodyErr = p.PTRResource(); bodyErr == nil {
 				a.onPTR(h.Name.String(), r.PTR.String())
 			}
 		case dnsmessage.TypeSRV:
-			if r, err := p.SRVResource(); err == nil {
+			var r dnsmessage.SRVResource
+			if r, bodyErr = p.SRVResource(); bodyErr == nil {
 				a.onSRV(h.Name.String(), r.Target.String(), int(r.Port))
 			}
 		case dnsmessage.TypeTXT:
-			if r, err := p.TXTResource(); err == nil {
+			var r dnsmessage.TXTResource
+			if r, bodyErr = p.TXTResource(); bodyErr == nil {
 				a.onTXT(h.Name.String(), r.TXT)
 			}
 		case dnsmessage.TypeA:
-			if r, err := p.AResource(); err == nil {
+			var r dnsmessage.AResource
+			if r, bodyErr = p.AResource(); bodyErr == nil {
 				a.onAddr(h.Name.String(), net.IP(r.A[:]))
 			}
 		case dnsmessage.TypeAAAA:
-			if r, err := p.AAAAResource(); err == nil {
+			var r dnsmessage.AAAAResource
+			if r, bodyErr = p.AAAAResource(); bodyErr == nil {
 				a.onAddr(h.Name.String(), net.IP(r.AAAA[:]))
 			}
 		default:
-			if err := skip(); err != nil {
-				return
-			}
+			bodyErr = skip()
+		}
+		// A body that fails to parse leaves the parser on the same header, so
+		// stop here instead of reading that header again forever.
+		if bodyErr != nil {
+			return
 		}
 	}
 }

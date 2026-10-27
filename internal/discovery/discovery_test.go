@@ -172,3 +172,30 @@ func TestRepeatedResponsesAreNotReemitted(t *testing.T) {
 		t.Fatalf("refresh emitted %d services", len(later))
 	}
 }
+
+func TestAssemblerSurvivesMalformedRecord(t *testing.T) {
+	msg := dnsmessage.Message{
+		Header: dnsmessage.Header{Response: true},
+		Answers: []dnsmessage.Resource{{
+			Header: dnsmessage.ResourceHeader{Name: dnsmessage.MustNewName("host.local."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET},
+			Body:   &dnsmessage.AResource{A: [4]byte{192, 168, 1, 9}},
+		}},
+	}
+	data, err := msg.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	data[len(data)-5] = 3
+	data = data[:len(data)-1]
+
+	done := make(chan struct{})
+	go func() {
+		newAssembler(ServiceIPP).ingest(data)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ingest did not return on a malformed record")
+	}
+}

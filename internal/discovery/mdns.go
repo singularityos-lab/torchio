@@ -67,6 +67,8 @@ func (m MDNS) Browse(ctx context.Context) (<-chan Service, error) {
 				if ctx.Err() != nil {
 					return
 				}
+				// A socket that keeps failing would otherwise spin a core.
+				time.Sleep(time.Second)
 				continue
 			}
 			for _, s := range asm.changed(asm.ingest(buf[:n]), time.Now()) {

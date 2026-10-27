@@ -163,6 +163,8 @@ func (r *Responder) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
+			// A socket that keeps failing would otherwise spin a core.
+			time.Sleep(time.Second)
 			continue
 		}
 		if resp, ok := r.answer(buf[:n]); ok {

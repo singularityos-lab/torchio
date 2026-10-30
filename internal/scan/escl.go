@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/singularityos-lab/torchio/internal/discovery"
 )
 
 // Scanner is an eSCL scanner reachable at a base URL (e.g. http://host:8080/eSCL).
@@ -26,7 +28,7 @@ type Scanner struct {
 func NewScanner(baseURL string) *Scanner {
 	return &Scanner{
 		base: strings.TrimRight(baseURL, "/"),
-		http: &http.Client{Timeout: 60 * time.Second},
+		http: &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: discovery.DialContext}},
 	}
 }
 

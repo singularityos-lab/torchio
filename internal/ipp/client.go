@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/OpenPrinting/goipp"
+
+	"github.com/singularityos-lab/torchio/internal/discovery"
 )
 
 // Client is a reusable IPP client. The zero value is not usable; construct it
@@ -47,6 +49,7 @@ func NewClient(opts ...Option) *Client {
 		http: &http.Client{
 			Timeout: 30 * time.Second,
 			Transport: &http.Transport{
+				DialContext: discovery.DialContext,
 				// TOFU is enforced a layer up; do not reject self-signed
 				// printer certs at the transport level.
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec

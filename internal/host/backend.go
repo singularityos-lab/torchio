@@ -5,10 +5,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"sync"
 	"time"
+
+	"github.com/singularityos-lab/torchio/internal/discovery"
 )
 
 // Backend is where the driver's output (the printer's own language) goes: the
@@ -81,8 +82,9 @@ func (b SocketBackend) Send(ctx context.Context, r io.Reader) error {
 	if timeout == 0 {
 		timeout = 10 * time.Second
 	}
-	d := net.Dialer{Timeout: timeout}
-	conn, err := d.DialContext(ctx, "tcp", b.Addr)
+	dialCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := discovery.DialContext(dialCtx, "tcp", b.Addr)
 	if err != nil {
 		return fmt.Errorf("host: dial backend %s: %w", b.Addr, err)
 	}

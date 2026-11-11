@@ -26,11 +26,11 @@ type Store struct {
 }
 
 // Open opens (creating if needed) the SQLite database at path and applies the
-// schema. WAL, foreign keys and a busy timeout are set via the DSN so every
+// schema. WAL with normal sync, foreign keys and a busy timeout are set via the DSN so every
 // pooled connection inherits them. Use ":memory:" for tests, but note that an
 // in-memory DB is per-connection, so the pool is pinned to one connection.
 func Open(path string) (*Store, error) {
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store: open: %w", err)

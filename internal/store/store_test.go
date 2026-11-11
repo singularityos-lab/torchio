@@ -238,3 +238,19 @@ func TestDevicesCache(t *testing.T) {
 		t.Errorf("devices = %+v", devices)
 	}
 }
+
+func TestOpenSyncsOnCheckpointOnly(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "torchio.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var mode string
+	var level int
+	if err := s.db.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil || mode != "wal" {
+		t.Fatalf("journal mode %q %v", mode, err)
+	}
+	if err := s.db.QueryRow(`PRAGMA synchronous`).Scan(&level); err != nil || level != 1 {
+		t.Fatalf("synchronous %d %v", level, err)
+	}
+}

@@ -6,6 +6,7 @@ require (
 	github.com/OpenPrinting/goipp v1.2.0
 	github.com/godbus/dbus/v5 v5.2.4
 	github.com/klippa-app/go-pdfium v1.21.3
+	github.com/mirkobrombin/atomloops v0.2.10-0.20261124173743-7a06152b95de
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/net v0.61.0
 	golang.org/x/sys v0.49.0

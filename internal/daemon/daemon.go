@@ -31,6 +31,7 @@ import (
 
 // Daemon holds the running components so they can be shut down in order.
 type Daemon struct {
+	OnReady  func()
 	store    *store.Store
 	spool    *spool.Spool
 	engine   *queue.Engine
@@ -215,6 +216,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	d.startPrintPortal(ctx)
 	d.startCupsCompat(ctx)
+	if d.OnReady != nil {
+		d.OnReady()
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- d.server.Serve(ctx) }()

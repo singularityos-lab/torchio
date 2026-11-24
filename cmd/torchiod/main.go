@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/mirkobrombin/atomloops/sealedlog"
+
 	"github.com/singularityos-lab/torchio/internal/daemon"
 )
 
@@ -19,14 +21,19 @@ func main() {
 		log.Fatalf("unexpected argument %q", os.Args[1])
 	}
 
+	sealed, _ := sealedlog.Open("torchio")
+	sealed.Log("start")
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	d, err := daemon.Open()
 	if err != nil {
+		sealed.Log("fail", 1)
 		log.Fatal(err)
 	}
+	d.OnReady = func() { sealed.Log("ready") }
 	if err := d.Run(ctx); err != nil {
+		sealed.Log("fail", 2)
 		log.Fatal(err)
 	}
 }
